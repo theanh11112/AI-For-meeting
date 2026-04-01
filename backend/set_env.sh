@@ -14,29 +14,38 @@ update_api_key() {
 }
 
 # Function to check if key needs update
+#!/bin/bash
+
+echo "Setting up environment variables..."
+
+# Nếu chưa có .env thì mới copy
+if [ ! -f .env ]; then
+    cp temp.env .env
+fi
+
+update_api_key() {
+    local key_name=$1
+    local key_value=$2
+    sed -i "" "s|$key_name=.*|$key_name=$key_value|g" .env
+}
+
 needs_update() {
     local value=$1
     [[ -z "$value" || "$value" == "api_key_here" || "$value" == "gapi_key_here" ]]
 }
 
-# Update API keys in .env file
 for key in ANTHROPIC_API_KEY GROQ_API_KEY OPENAI_API_KEY; do
-    # Get current value from environment
     current_value="${!key}"
-    
-    # Check if key needs to be updated
+
     if needs_update "$current_value"; then
-        echo "$key is not set. Press Enter to skip or enter your API key:"
-        read -p "Enter $key (or press Enter to skip): " new_value
-        if [ -n "$new_value" ]; then
-            update_api_key "$key" "$new_value"
-        fi
+        echo "$key is not set → skipping (AI disabled)"
+        continue
     else
         update_api_key "$key" "$current_value"
     fi
 done
 
-# Print final environment variables
 echo "Final API Keys:"
-grep -E "^(ANTHROPIC|GROQ|OPENAI)_API_KEY=" .env
+grep -E "^(ANTHROPIC|GROQ|OPENAI)_API_KEY=" .env || echo "No API keys set"
+
 echo "Environment setup complete!"

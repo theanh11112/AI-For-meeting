@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useContext, useCallback } from 'react';
+import { useState, useEffect, useContext, useCallback, useRef } from 'react';
 import { Transcript, Summary, SummaryResponse } from '@/types';
 import { EditableTitle } from '@/components/EditableTitle';
 import { TranscriptView } from '@/components/TranscriptView';
@@ -10,8 +10,29 @@ import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { listen } from '@tauri-apps/api/event';
 import { writeTextFile } from '@tauri-apps/plugin-fs';
 import { downloadDir } from '@tauri-apps/api/path';
-import { listenerCount } from 'process';
 import { invoke } from '@tauri-apps/api/core';
+
+// Danh sách ngôn ngữ hỗ trợ
+const SUPPORTED_LANGUAGES = [
+  { code: 'en', name: '🇬🇧 English', short: 'EN' },
+  { code: 'vi', name: '🇻🇳 Tiếng Việt', short: 'VI' },
+  { code: 'zh', name: '🇨🇳 中文', short: 'ZH' },
+  { code: 'ja', name: '🇯🇵 日本語', short: 'JA' },
+  { code: 'ko', name: '🇰🇷 한국어', short: 'KO' },
+  { code: 'fr', name: '🇫🇷 Français', short: 'FR' },
+  { code: 'de', name: '🇩🇪 Deutsch', short: 'DE' },
+  { code: 'es', name: '🇪🇸 Español', short: 'ES' },
+  { code: 'ru', name: '🇷🇺 Русский', short: 'RU' },
+  { code: 'th', name: '🇹🇭 ไทย', short: 'TH' },
+  { code: 'hi', name: '🇮🇳 हिन्दी', short: 'HI' },
+  { code: 'it', name: '🇮🇹 Italiano', short: 'IT' },
+  { code: 'pt', name: '🇵🇹 Português', short: 'PT' },
+  { code: 'nl', name: '🇳🇱 Nederlands', short: 'NL' },
+  { code: 'pl', name: '🇵🇱 Polski', short: 'PL' },
+  { code: 'tr', name: '🇹🇷 Türkçe', short: 'TR' },
+  { code: 'id', name: '🇮🇩 Indonesia', short: 'ID' },
+  { code: 'ar', name: '🇸🇦 العربية', short: 'AR' },
+];
 
 interface TranscriptUpdate {
   text: string;
@@ -49,21 +70,25 @@ export default function Home() {
     main_topics: { title: "Main Topics", blocks: [] }
   });
   const [summaryResponse, setSummaryResponse] = useState<SummaryResponse | null>(null);
-
   const [isCollapsed, setIsCollapsed] = useState(false);
-
   const [summaryError, setSummaryError] = useState<string | null>(null);
-
   const [modelConfig, setModelConfig] = useState<ModelConfig>({
     provider: 'ollama',
     model: 'llama3.2:latest',
     whisperModel: 'large-v3'
   });
-
   const [originalTranscript, setOriginalTranscript] = useState<string>('');
-
   const [models, setModels] = useState<OllamaModel[]>([]);
   const [error, setError] = useState<string>('');
+
+  // State cho dịch
+  const [targetLanguage, setTargetLanguage] = useState('en');
+  const [translatedSegments, setTranslatedSegments] = useState<{ timestamp: string; original: string; translated: string }[]>([]);
+  const [isTranslating, setIsTranslating] = useState(false);
+  const [detectedLanguage, setDetectedLanguage] = useState<string>('auto');
+
+  // State cho thời gian tương đối
+  const [startRecordingTime, setStartRecordingTime] = useState<Date | null>(null);
 
   const modelOptions = {
     ollama: models.map(model => model.name),
@@ -81,41 +106,85 @@ export default function Home() {
   }, [models]);
 
   const whisperModels = [
-    'tiny',
-    'tiny.en',
-    'tiny-q5_1',
-    'tiny.en-q5_1',
-    'tiny-q8_0',
-    'base',
-    'base.en',
-    'base-q5_1',
-    'base.en-q5_1',
-    'base-q8_0',
-    'small',
-    'small.en',
-    'small.en-tdrz',
-    'small-q5_1',
-    'small.en-q5_1',
-    'small-q8_0',
-    'medium',
-    'medium.en',
-    'medium-q5_0',
-    'medium.en-q5_0',
-    'medium-q8_0',
-    'large-v1',
-    'large-v2',
-    'large-v2-q5_0',
-    'large-v2-q8_0',
-    'large-v3',
-    'large-v3-q5_0',
-    'large-v3-turbo',
-    'large-v3-turbo-q5_0',
-    'large-v3-turbo-q8_0'
+    'tiny', 'tiny.en', 'tiny-q5_1', 'tiny.en-q5_1', 'tiny-q8_0',
+    'base', 'base.en', 'base-q5_1', 'base.en-q5_1', 'base-q8_0',
+    'small', 'small.en', 'small.en-tdrz', 'small-q5_1', 'small.en-q5_1', 'small-q8_0',
+    'medium', 'medium.en', 'medium-q5_0', 'medium.en-q5_0', 'medium-q8_0',
+    'large-v1', 'large-v2', 'large-v2-q5_0', 'large-v2-q8_0',
+    'large-v3', 'large-v3-q5_0', 'large-v3-turbo', 'large-v3-turbo-q5_0', 'large-v3-turbo-q8_0'
   ];
 
   const [showModelSettings, setShowModelSettings] = useState(false);
-
   const { setCurrentMeeting } = useSidebar();
+
+  // Format thời gian tương đối từ lúc bắt đầu ghi
+  const formatRelativeTime = useCallback((timestamp: string) => {
+    if (!startRecordingTime) return '0:00';
+    
+    try {
+      const absoluteTime = new Date(timestamp);
+      const diffMs = absoluteTime.getTime() - startRecordingTime.getTime();
+      
+      // Nếu timestamp trước thời gian bắt đầu (do lỗi), trả về 0:00
+      if (diffMs < 0) return '0:00';
+      
+      const totalSeconds = Math.floor(diffMs / 1000);
+      const minutes = Math.floor(totalSeconds / 60);
+      const seconds = totalSeconds % 60;
+      
+      return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+    } catch {
+      return '0:00';
+    }
+  }, [startRecordingTime]);
+
+  // Hàm dịch một đoạn text
+  const translateSegment = useCallback(async (text: string, timestamp: string) => {
+    if (!text || text.trim() === '') return null;
+    
+    try {
+      const response = await fetch('http://localhost:5167/translate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text: text,
+          target_lang: targetLanguage,
+          source_lang: 'auto'
+        })
+      });
+      
+      if (!response.ok) throw new Error(`Translation API error: ${response.status}`);
+      
+      const data = await response.json();
+      return { original: text, translated: data.translated, timestamp };
+    } catch (error) {
+      console.error('Translation error:', error);
+      return { original: text, translated: '[Translation failed]', timestamp };
+    }
+  }, [targetLanguage]);
+
+  // Dịch tất cả các đoạn transcript mới
+  useEffect(() => {
+    const translateAllSegments = async () => {
+      if (transcripts.length === 0) {
+        setTranslatedSegments([]);
+        return;
+      }
+      
+      setIsTranslating(true);
+      const results = await Promise.all(
+        transcripts.map(async (t) => {
+          const existing = translatedSegments.find(s => s.timestamp === t.timestamp);
+          if (existing) return existing;
+          return await translateSegment(t.text, t.timestamp);
+        })
+      );
+      setTranslatedSegments(results.filter(r => r !== null) as any);
+      setIsTranslating(false);
+    };
+    
+    translateAllSegments();
+  }, [transcripts, targetLanguage, translateSegment]);
 
   useEffect(() => {
     setCurrentMeeting({ id: 'intro-call', title: meetingTitle });
@@ -132,55 +201,35 @@ export default function Home() {
           return newHeights;
         });
       }, 300);
-
       return () => clearInterval(interval);
     }
   }, [isRecording]);
 
   useEffect(() => {
     let unlistenFn: (() => void) | undefined;
-    let transcriptCounter = 0;  // Counter for unique IDs
+    let transcriptCounter = 0;
 
     const setupListener = async () => {
       try {
-        console.log('Setting up transcript listener...');
         unlistenFn = await listen<TranscriptUpdate>('transcript-update', (event) => {
-          console.log('Received transcript update:', event.payload);
           const newTranscript = {
-            id: `${Date.now()}-${transcriptCounter++}`,  // Combine timestamp with counter for uniqueness
+            id: `${Date.now()}-${transcriptCounter++}`,
             text: event.payload.text,
             timestamp: event.payload.timestamp,
           };
           setTranscripts(prev => {
-            // Check if this transcript already exists
             const exists = prev.some(
               t => t.text === event.payload.text && t.timestamp === event.payload.timestamp
             );
-            if (exists) {
-              console.log('Duplicate transcript, skipping:', newTranscript);
-              return prev;
-            }
-            console.log('Adding new transcript:', newTranscript);
-            return [...prev, newTranscript];
+            return exists ? prev : [...prev, newTranscript];
           });
         });
-        console.log('Transcript listener setup complete');
       } catch (error) {
         console.error('Failed to setup transcript listener:', error);
-        alert('Failed to setup transcript listener. Check console for details.');
       }
     };
-
     setupListener();
-    console.log('Started listener setup');
-
-    return () => {
-      console.log('Cleaning up transcript listener...');
-      if (unlistenFn) {
-        unlistenFn();
-        console.log('Transcript listener cleaned up');
-      }
-    };
+    return () => { if (unlistenFn) unlistenFn(); };
   }, []);
 
   useEffect(() => {
@@ -188,15 +237,9 @@ export default function Home() {
       try {
         const response = await fetch('http://localhost:11434/api/tags', {
           method: 'GET',
-          headers: {
-            'Content-Type': 'application/json',
-          },
+          headers: { 'Content-Type': 'application/json' },
         });
-
-        if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`);
-        }
-
+        if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
         const data = await response.json();
         const modelList = data.models.map((model: any) => ({
           name: model.name,
@@ -207,145 +250,85 @@ export default function Home() {
         setModels(modelList);
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Failed to load Ollama models');
-        console.error('Error loading models:', err);
       }
     };
-
     loadModels();
   }, []);
 
   const formatSize = (size: number): string => {
-    if (size < 1024) {
-      return `${size} B`;
-    } else if (size < 1024 * 1024) {
-      return `${(size / 1024).toFixed(1)} KB`;
-    } else if (size < 1024 * 1024 * 1024) {
-      return `${(size / (1024 * 1024)).toFixed(1)} MB`;
-    } else {
-      return `${(size / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-    }
+    if (size < 1024) return `${size} B`;
+    if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+    if (size < 1024 * 1024 * 1024) return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(size / (1024 * 1024 * 1024)).toFixed(1)} GB`;
   };
 
   const handleRecordingStart = async () => {
     try {
-      console.log('Starting recording...');
-      const { invoke } = await import('@tauri-apps/api/core');
+      // Lưu thời điểm bắt đầu ghi
+      setStartRecordingTime(new Date());
       
-      // First check if we're already recording
+      const { invoke } = await import('@tauri-apps/api/core');
       const isCurrentlyRecording = await invoke('is_recording');
-      if (isCurrentlyRecording) {
-        console.log('Already recording, stopping first...');
-        await handleRecordingStop();
-      }
-
-      // Start new recording with whisper model
-      await invoke('start_recording', {
-        args: {
-          whisper_model: modelConfig.whisperModel
-        }
-      });
-      console.log('Recording started successfully');
+      if (isCurrentlyRecording) await handleRecordingStop();
+      await invoke('start_recording', { args: { whisper_model: modelConfig.whisperModel } });
       setIsRecording(true);
-      setTranscripts([]); // Clear previous transcripts when starting new recording
+      setTranscripts([]);
+      setTranslatedSegments([]);
+      setDetectedLanguage('auto');
     } catch (error) {
       console.error('Failed to start recording:', error);
       alert('Failed to start recording. Check console for details.');
-      setIsRecording(false); // Reset state on error
+      setIsRecording(false);
+      setStartRecordingTime(null);
     }
   };
 
   const handleRecordingStop = async () => {
     try {
-      console.log('Stopping recording...');
       const { invoke } = await import('@tauri-apps/api/core');
       const { appDataDir } = await import('@tauri-apps/api/path');
-      
       const dataDir = await appDataDir();
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       const transcriptPath = `${dataDir}transcript-${timestamp}.txt`;
       const audioPath = `${dataDir}recording-${timestamp}.wav`;
-
-      // Stop recording and save audio
-      await invoke('stop_recording', { 
-        args: { 
-          save_path: audioPath,
-          model_config: modelConfig
-        }
-      });
-      console.log('Recording stopped successfully');
-
-      // Format and save transcript
+      await invoke('stop_recording', { args: { save_path: audioPath, model_config: modelConfig } });
+      
       const formattedTranscript = transcripts
         .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
-        .map(t => `[${t.timestamp}] ${t.text}`)
+        .map(t => `[${formatRelativeTime(t.timestamp)}] ${t.text}`)
         .join('\n\n');
-
       const documentContent = `Meeting Title: ${meetingTitle}\nDate: ${new Date().toLocaleString()}\n\nTranscript:\n${formattedTranscript}`;
-
-      await invoke('save_transcript', { 
-        filePath: transcriptPath,
-        content: documentContent
-      });
-      console.log('Transcript saved to:', transcriptPath);
-
+      await invoke('save_transcript', { filePath: transcriptPath, content: documentContent });
       setIsRecording(false);
-      
-      // Show summary button if we have transcript content
-      if (formattedTranscript.trim()) {
-        setShowSummary(true);
-      } else {
-        console.log('No transcript content available');
-      }
+      setStartRecordingTime(null); // Reset thời gian bắt đầu
+      if (formattedTranscript.trim()) setShowSummary(true);
     } catch (error) {
       console.error('Failed to stop recording:', error);
-      if (error instanceof Error) {
-        console.error('Error details:', {
-          message: error.message,
-          name: error.name,
-          stack: error.stack,
-        });
-      }
       alert('Failed to stop recording. Check console for details.');
-      setIsRecording(false); // Reset state on error
+      setIsRecording(false);
+      setStartRecordingTime(null);
     }
   };
 
   const handleTranscriptUpdate = (update: any) => {
-    console.log('Handling transcript update:', update);
     const newTranscript = {
       id: Date.now().toString(),
       text: update.text,
       timestamp: update.timestamp,
     };
     setTranscripts(prev => {
-      // Check if this transcript already exists
-      const exists = prev.some(
-        t => t.text === update.text && t.timestamp === update.timestamp
-      );
-      if (exists) {
-        return prev;
-      }
-      return [...prev, newTranscript];
+      const exists = prev.some(t => t.text === update.text && t.timestamp === update.timestamp);
+      return exists ? prev : [...prev, newTranscript];
     });
   };
 
   const generateAISummary = useCallback(async () => {
     setSummaryStatus('processing');
     setSummaryError(null);
-
     try {
       const fullTranscript = transcripts.map(t => t.text).join('\n');
-      if (!fullTranscript.trim()) {
-        throw new Error('No transcript text available. Please add some text first.');
-      }
-      
-      // Store the original transcript for regeneration
+      if (!fullTranscript.trim()) throw new Error('No transcript text available.');
       setOriginalTranscript(fullTranscript);
-      
-      console.log('Generating summary for transcript length:', fullTranscript.length);
-      
-      // Process transcript and get process_id
-      console.log('Processing transcript...');
       const response = await fetch('http://localhost:5167/process-transcript', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -357,248 +340,21 @@ export default function Home() {
           overlap: 1000
         })
       });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        console.error('Process transcript failed:', errorData);
-        setSummaryError(errorData.error || 'Failed to process transcript');
-        setSummaryStatus('error');
-        return;
-      }
-
+      if (!response.ok) throw new Error('Failed to process transcript');
       const { process_id } = await response.json();
-      console.log('Process ID:', process_id);
-
-      // Poll for summary status
       const pollInterval = setInterval(async () => {
         try {
           const statusResponse = await fetch(`http://localhost:5167/get-summary/${process_id}`);
-          
-          if (!statusResponse.ok) {
-            const errorData = await statusResponse.json();
-            console.error('Get summary failed:', errorData);
-            setSummaryError(errorData.error || 'Unknown error');
-            setSummaryStatus('error');
-            clearInterval(pollInterval);
-            return;
-          }
-
+          if (!statusResponse.ok) throw new Error('Failed to get summary');
           const result = await statusResponse.json();
-          console.log('Summary status:', result);
-
           if (result.status === 'error') {
-            setSummaryError(result.error || 'Unknown error');
+            setSummaryError(result.error);
             setSummaryStatus('error');
             clearInterval(pollInterval);
-            return;
-          }
-
-          if (result.status === 'completed' && result.data) {
+          } else if (result.status === 'completed' && result.data) {
             clearInterval(pollInterval);
-            
-            // Remove MeetingName from data before formatting
             const { MeetingName, ...summaryData } = result.data;
-            
-            // Update meeting title if available
-            if (MeetingName) {
-              setMeetingTitle(MeetingName);
-            }
-
-            // Format the summary data with consistent styling
-            const formattedSummary = Object.entries(summaryData).reduce((acc: Summary, [key, section]: [string, any]) => {
-              acc[key] = {
-                title: section.title,
-                blocks: section.blocks.map((block: any) => ({
-                  ...block,
-                  type: 'bullet',
-                  color: 'default',
-                  content: block.content.trim() // Remove trailing newlines
-                }))
-              };
-              return acc;
-            }, {} as Summary);
-
-            setAiSummary(formattedSummary);
-            setSummaryStatus('completed');
-          }
-        } catch (error) {
-          console.error('Failed to get summary status:', error);
-          if (error instanceof Error) {
-            setSummaryError(`Failed to get summary status: ${error.message}`);
-          } else {
-            setSummaryError('Failed to get summary status: Unknown error');
-          }
-          setSummaryStatus('error');
-          clearInterval(pollInterval);
-        }
-      }, 5000); // Poll every 30 seconds
-
-      // Cleanup interval on component unmount
-      return () => clearInterval(pollInterval);
-      
-    } catch (error) {
-      console.error('Failed to generate summary:', error);
-      if (error instanceof Error) {
-        setSummaryError(`Failed to generate summary: ${error.message}`);
-      } else {
-        setSummaryError('Failed to generate summary: Unknown error');
-      }
-      setSummaryStatus('error');
-    }
-  }, [transcripts, modelConfig]);
-
-  const handleSummary = useCallback((summary: any) => {
-    setAiSummary(summary);
-  }, []);
-
-  const handleSummaryChange = (newSummary: Summary) => {
-    console.log('Summary changed:', newSummary);
-    setAiSummary(newSummary);
-  };
-
-  const handleTitleChange = (newTitle: string) => {
-    setMeetingTitle(newTitle);
-    setCurrentMeeting({ id: 'intro-call', title: newTitle });
-  };
-
-  const getSummaryStatusMessage = (status: SummaryStatus) => {
-    switch (status) {
-      case 'idle':
-        return 'Ready to generate summary';
-      case 'processing':
-        return 'Processing transcript...';
-      case 'summarizing':
-        return 'Generating AI summary...';
-      case 'regenerating':
-        return 'Regenerating AI summary...';
-      case 'completed':
-        return 'Summary generated successfully!';
-      case 'error':
-        return summaryError || 'An error occurred';
-      default:
-        return '';
-    }
-  };
-
-  const handleDownloadTranscript = async () => {
-    try {
-      // Create transcript object with metadata
-      const transcriptData = {
-        title: meetingTitle,
-        timestamp: new Date().toISOString(),
-        transcripts: transcripts
-      };
-
-      // Generate filename
-      const sanitizedTitle = meetingTitle.replace(/[^a-zA-Z0-9]/g, '_');
-      const filename = `${sanitizedTitle}_transcript.json`;
-      
-      // Get download directory path
-      const downloadPath = await downloadDir();
-      
-      // Write file to downloads directory
-      await writeTextFile(`${downloadPath}/${filename}`, JSON.stringify(transcriptData, null, 2));
-
-      console.log('Transcript saved successfully to:', `${downloadPath}/${filename}`);
-      alert('Transcript downloaded successfully!');
-    } catch (error) {
-      console.error('Failed to save transcript:', error);
-      alert('Failed to save transcript. Please try again.');
-    }
-  };
-
-  const handleUploadTranscript = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    try {
-      const text = await file.text();
-      const data = JSON.parse(text);
-      
-      // Validate the uploaded file structure
-      if (!data.transcripts || !Array.isArray(data.transcripts)) {
-        throw new Error('Invalid transcript file format');
-      }
-
-      // Update state with uploaded data
-      setMeetingTitle(data.title || 'Uploaded Transcript');
-      setTranscripts(data.transcripts);
-      
-      // Generate summary for the uploaded transcript
-      handleSummary(data.transcripts);
-    } catch (error) {
-      console.error('Error uploading transcript:', error);
-      alert('Failed to upload transcript. Please make sure the file format is correct.');
-    }
-  };
-
-  const handleRegenerateSummary = useCallback(async () => {
-    if (!originalTranscript.trim()) {
-      console.error('No original transcript available for regeneration');
-      return;
-    }
-
-    setSummaryStatus('regenerating');
-    setSummaryError(null);
-
-    try {
-      console.log('Regenerating summary with original transcript...');
-      
-      // Process transcript and get process_id
-      console.log('Processing transcript...');
-      const response = await fetch('http://localhost:5167/process-transcript', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          text: originalTranscript,
-          model: modelConfig.provider,
-          model_name: modelConfig.model,
-          chunk_size: 40000,
-          overlap: 1000
-        })
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        console.error('Process transcript failed:', errorData);
-        throw new Error(errorData.error || 'Failed to process transcript');
-      }
-
-      const { process_id } = await response.json();
-      console.log('Process ID:', process_id);
-
-      // Poll for summary status
-      const pollInterval = setInterval(async () => {
-        try {
-          const statusResponse = await fetch(`http://localhost:5167/get-summary/${process_id}`);
-          if (!statusResponse.ok) {
-            const errorData = await statusResponse.json();
-            console.error('Get summary failed:', errorData);
-            throw new Error(errorData.error || 'Failed to get summary status');
-          }
-
-          const result = await statusResponse.json();
-          console.log('Summary status:', result);
-
-          if (result.status === 'error') {
-            setSummaryError(result.error || 'Unknown error');
-            setSummaryStatus('error');
-            clearInterval(pollInterval);
-            return;
-          }
-
-          if (result.status === 'completed' && result.data) {
-            clearInterval(pollInterval);
-            
-            // Remove MeetingName from data before formatting
-            const { MeetingName, ...summaryData } = result.data;
-            
-            // Update meeting title if available
-            if (MeetingName) {
-              setMeetingTitle(MeetingName);
-            }
-
-            // Format the summary data with consistent styling
+            if (MeetingName) setMeetingTitle(MeetingName);
             const formattedSummary = Object.entries(summaryData).reduce((acc: Summary, [key, section]: [string, any]) => {
               acc[key] = {
                 title: section.title,
@@ -611,65 +367,112 @@ export default function Home() {
               };
               return acc;
             }, {} as Summary);
-
             setAiSummary(formattedSummary);
             setSummaryStatus('completed');
-          } else if (result.status === 'error') {
-            clearInterval(pollInterval);
-            throw new Error(result.error || 'Failed to generate summary');
           }
         } catch (error) {
           clearInterval(pollInterval);
-          console.error('Failed to get summary status:', error);
-          if (error instanceof Error) {
-            setSummaryError(error.message);
-          } else {
-            setSummaryError('An unexpected error occurred');
-          }
           setSummaryStatus('error');
-          setAiSummary(null);
         }
-      }, 10000);
-
+      }, 5000);
       return () => clearInterval(pollInterval);
     } catch (error) {
-      console.error('Failed to regenerate summary:', error);
-      if (error instanceof Error) {
-        setSummaryError(error.message);
-      } else {
-        setSummaryError('An unexpected error occurred');
-      }
       setSummaryStatus('error');
-      setAiSummary(null);
     }
-  }, [originalTranscript, modelConfig]);
+  }, [transcripts, modelConfig]);
+
+  const handleTitleChange = (newTitle: string) => {
+    setMeetingTitle(newTitle);
+    setCurrentMeeting({ id: 'intro-call', title: newTitle });
+  };
+
+  const getSummaryStatusMessage = (status: SummaryStatus) => {
+    switch (status) {
+      case 'idle': return 'Ready to generate summary';
+      case 'processing': return 'Processing transcript...';
+      case 'summarizing': return 'Generating AI summary...';
+      case 'regenerating': return 'Regenerating AI summary...';
+      case 'completed': return 'Summary generated successfully!';
+      case 'error': return summaryError || 'An error occurred';
+      default: return '';
+    }
+  };
 
   const handleCopyTranscript = useCallback(() => {
     const fullTranscript = transcripts
-      .map(t => `${t.timestamp}: ${t.text}`)
+      .map(t => `[${formatRelativeTime(t.timestamp)}] ${t.text}`)
       .join('\n');
     navigator.clipboard.writeText(fullTranscript);
-  }, [transcripts]);
+  }, [transcripts, formatRelativeTime]);
 
   const handleGenerateSummary = useCallback(async () => {
-    if (!transcripts.length) {
-      console.log('No transcripts available for summary');
-      return;
-    }
-    
-    try {
-      await generateAISummary();
-    } catch (error) {
-      console.error('Failed to generate summary:', error);
-      if (error instanceof Error) {
-        setSummaryError(error.message);
-      } else {
-        setSummaryError('Failed to generate summary: Unknown error');
-      }
-    }
+    if (!transcripts.length) return;
+    await generateAISummary();
   }, [transcripts, generateAISummary]);
 
+  const handleRegenerateSummary = useCallback(async () => {
+    if (!originalTranscript.trim()) return;
+    setSummaryStatus('regenerating');
+    setSummaryError(null);
+    try {
+      const response = await fetch('http://localhost:5167/process-transcript', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text: originalTranscript,
+          model: modelConfig.provider,
+          model_name: modelConfig.model,
+          chunk_size: 40000,
+          overlap: 1000
+        })
+      });
+      if (!response.ok) throw new Error('Failed to process transcript');
+      const { process_id } = await response.json();
+      const pollInterval = setInterval(async () => {
+        try {
+          const statusResponse = await fetch(`http://localhost:5167/get-summary/${process_id}`);
+          if (!statusResponse.ok) throw new Error('Failed to get summary');
+          const result = await statusResponse.json();
+          if (result.status === 'error') {
+            setSummaryError(result.error);
+            setSummaryStatus('error');
+            clearInterval(pollInterval);
+          } else if (result.status === 'completed' && result.data) {
+            clearInterval(pollInterval);
+            const { MeetingName, ...summaryData } = result.data;
+            if (MeetingName) setMeetingTitle(MeetingName);
+            const formattedSummary = Object.entries(summaryData).reduce((acc: Summary, [key, section]: [string, any]) => {
+              acc[key] = {
+                title: section.title,
+                blocks: section.blocks.map((block: any) => ({
+                  ...block,
+                  type: 'bullet',
+                  color: 'default',
+                  content: block.content.trim()
+                }))
+              };
+              return acc;
+            }, {} as Summary);
+            setAiSummary(formattedSummary);
+            setSummaryStatus('completed');
+          }
+        } catch (error) {
+          clearInterval(pollInterval);
+          setSummaryStatus('error');
+        }
+      }, 10000);
+      return () => clearInterval(pollInterval);
+    } catch (error) {
+      setSummaryStatus('error');
+    }
+  }, [originalTranscript, modelConfig]);
+
   const isSummaryLoading = summaryStatus === 'processing' || summaryStatus === 'summarizing' || summaryStatus === 'regenerating';
+
+  const getLanguageName = (code: string) => {
+    const lang = SUPPORTED_LANGUAGES.find(l => l.code === code);
+    return lang ? lang.name : code;
+  };
 
   return (
     <div className="flex flex-col h-screen bg-gray-50">
@@ -688,6 +491,8 @@ export default function Home() {
                   onChange={handleTitleChange}
                 />
               </div>
+
+              {/* Hàng nút Copy và Generate */}
               <div className="flex items-center space-x-2">
                 <button
                   onClick={handleCopyTranscript}
@@ -695,15 +500,14 @@ export default function Home() {
                   className={`px-3 py-2 border rounded-md transition-all duration-200 inline-flex items-center gap-2 shadow-sm ${
                     transcripts.length === 0
                       ? 'bg-gray-50 border-gray-200 text-gray-400 cursor-not-allowed'
-                      : 'bg-blue-50 border-blue-200 text-blue-700 hover:bg-blue-100 hover:border-blue-300 active:bg-blue-200'
+                      : 'bg-blue-50 border-blue-200 text-blue-700 hover:bg-blue-100'
                   }`}
-                  title={transcripts.length === 0 ? 'No transcript available' : 'Copy Transcript'}
                 >
                   <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 24 24" strokeWidth="2" stroke="currentColor" fill="none">
                     <path strokeLinecap="round" strokeLinejoin="round" d="M15.666 3.888A2.25 2.25 0 0 0 13.5 3h-6a2.25 2.25 0 0 0-2.25 2.25v13.5A2.25 2.25 0 0 0 7.5 21h6a2.25 2.25 0 0 0 2.25-2.25V7.5l-3.75-3.612z" />
                     <path strokeLinecap="round" strokeLinejoin="round" d="M15 3v3.75a.75.75 0 0 0 .75.75H18" />
                   </svg>
-                  <span className="text-sm">Copy Transcript</span>
+                  <span className="text-sm">Copy</span>
                 </button>
                 {showSummary && !isRecording && (
                   <>
@@ -715,15 +519,8 @@ export default function Home() {
                           ? 'bg-yellow-50 border-yellow-200 text-yellow-700'
                           : transcripts.length === 0
                           ? 'bg-gray-50 border-gray-200 text-gray-400 cursor-not-allowed'
-                          : 'bg-green-50 border-green-200 text-green-700 hover:bg-green-100 hover:border-green-300 active:bg-green-200'
+                          : 'bg-green-50 border-green-200 text-green-700 hover:bg-green-100'
                       }`}
-                      title={
-                        summaryStatus === 'processing'
-                          ? 'Generating summary...'
-                          : transcripts.length === 0
-                          ? 'No transcript available'
-                          : 'Generate AI Summary'
-                      }
                     >
                       {summaryStatus === 'processing' ? (
                         <>
@@ -744,8 +541,7 @@ export default function Home() {
                     </button>
                     <button
                       onClick={() => setShowModelSettings(true)}
-                      className="px-3 py-2 border rounded-md transition-all duration-200 inline-flex items-center gap-2 shadow-sm bg-gray-50 border-gray-200 text-gray-700 hover:bg-gray-100 hover:border-gray-300 active:bg-gray-200"
-                      title="Model Settings"
+                      className="px-3 py-2 border rounded-md transition-all duration-200 inline-flex items-center gap-2 shadow-sm bg-gray-50 border-gray-200 text-gray-700 hover:bg-gray-100"
                     >
                       <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                         <path strokeLinecap="round" strokeLinejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
@@ -755,12 +551,76 @@ export default function Home() {
                   </>
                 )}
               </div>
+
+              {/* Translation selector - nằm dưới hàng nút */}
+              <div className="flex items-center gap-2 p-2 bg-gradient-to-r from-blue-50 to-indigo-50 rounded-lg border border-blue-200">
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 text-blue-600 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M3 5h12M9 3v2m1.048 9.5A18.022 18.022 0 016.412 9m6.088 9h7M11 21l5-10 5 10M12.751 5C11.783 10.77 8.07 15.61 3 18.129" />
+                </svg>
+                <span className="text-xs font-medium text-blue-700 whitespace-nowrap">Dịch sang:</span>
+                <select
+                  value={targetLanguage}
+                  onChange={(e) => setTargetLanguage(e.target.value)}
+                  className="flex-1 px-2 py-1 text-sm border border-blue-300 rounded-md bg-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+                >
+                  {SUPPORTED_LANGUAGES.map(lang => (
+                    <option key={lang.code} value={lang.code}>
+                      {lang.name}
+                    </option>
+                  ))}
+                </select>
+                {isTranslating && (
+                  <div className="flex items-center gap-1">
+                    <svg className="animate-spin h-3 w-3 text-blue-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                  </div>
+                )}
+              </div>
             </div>
           </div>
 
-          {/* Transcript content */}
+          {/* Transcript content - HIỂN THỊ GỐC, HOVER MỚI HIỆN DỊCH */}
           <div className="flex-1 overflow-y-auto pb-32">
-            <TranscriptView transcripts={transcripts} />
+            {transcripts.length > 0 ? (
+              <div className="p-3 space-y-3">
+                {transcripts.map((item, idx) => {
+                  const translatedItem = translatedSegments.find(s => s.timestamp === item.timestamp);
+                  return (
+                    <div key={item.id} className="relative">
+                      <div className="flex items-start gap-2">
+                        <span className="text-[10px] font-mono text-gray-400 whitespace-nowrap mt-0.5">
+                          {formatRelativeTime(item.timestamp)}
+                        </span>
+                        <div className="flex-1">
+                          {/* Nội dung gốc - hover vào đây để hiện dịch */}
+                          <div className="group w-full">
+                            <p className="text-sm text-gray-700 leading-relaxed p-1 -m-1 rounded cursor-pointer transition-all duration-150 group-hover:bg-gray-100">
+                              {item.text}
+                            </p>
+                            {/* Nội dung dịch - chỉ hiện khi hover vào group */}
+                            {translatedItem && translatedItem.translated && (
+                              <div className="overflow-hidden transition-all duration-200 max-h-0 group-hover:max-h-24 group-hover:mt-2">
+                                <div className="pt-1">
+                                  <p className="text-sm text-blue-600 leading-relaxed border-l-2 border-blue-300 pl-2">
+                                    {translatedItem.translated}
+                                  </p>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="p-4 text-center text-gray-400 text-sm">
+                Chưa có transcript. Nhấn Record để bắt đầu ghi âm.
+              </div>
+            )}
           </div>
 
           {/* Recording controls */}
@@ -782,48 +642,35 @@ export default function Home() {
               <div className="bg-white rounded-lg p-6 max-w-md w-full mx-4 shadow-xl">
                 <div className="flex justify-between items-center mb-4">
                   <h3 className="text-lg font-semibold text-gray-900">Model Settings</h3>
-                  <button
-                    onClick={() => setShowModelSettings(false)}
-                    className="text-gray-500 hover:text-gray-700"
-                  >
+                  <button onClick={() => setShowModelSettings(false)} className="text-gray-500 hover:text-gray-700">
                     <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
                     </svg>
                   </button>
                 </div>
-
                 <div className="space-y-4">
                   <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">
-                      Summarization Model
-                    </label>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Summarization Model</label>
                     <div className="flex space-x-2">
                       <select
-                        className="px-3 py-2 text-sm bg-white border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500"
+                        className="px-3 py-2 text-sm bg-white border border-gray-300 rounded-md"
                         value={modelConfig.provider}
                         onChange={(e) => {
                           const provider = e.target.value as ModelConfig['provider'];
-                          setModelConfig({
-                            ...modelConfig,
-                            provider,
-                            model: modelOptions[provider][0]
-                          });
+                          setModelConfig({ ...modelConfig, provider, model: modelOptions[provider][0] });
                         }}
                       >
                         <option value="claude">Claude</option>
                         <option value="groq">Groq</option>
                         <option value="ollama">Ollama</option>
                       </select>
-
                       <select
-                        className="flex-1 px-3 py-2 text-sm bg-white border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500"
+                        className="flex-1 px-3 py-2 text-sm bg-white border border-gray-300 rounded-md"
                         value={modelConfig.model}
                         onChange={(e) => setModelConfig(prev => ({ ...prev, model: e.target.value }))}
                       >
                         {modelOptions[modelConfig.provider].map(model => (
-                          <option key={model} value={model}>
-                            {model}
-                          </option>
+                          <option key={model} value={model}>{model}</option>
                         ))}
                       </select>
                     </div>
@@ -831,18 +678,12 @@ export default function Home() {
                   {modelConfig.provider === 'ollama' && (
                     <div>
                       <h4 className="text-lg font-bold mb-4">Available Ollama Models</h4>
-                      {error && (
-                        <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded mb-4">
-                          {error}
-                        </div>
-                      )}
+                      {error && <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded mb-4">{error}</div>}
                       <div className="grid gap-4 max-h-[400px] overflow-y-auto pr-2">
                         {models.map((model) => (
                           <div 
                             key={model.id}
-                            className={`bg-white p-4 rounded-lg shadow cursor-pointer transition-colors ${
-                              modelConfig.model === model.name ? 'ring-2 ring-blue-500 bg-blue-50' : 'hover:bg-gray-50'
-                            }`}
+                            className={`bg-white p-4 rounded-lg shadow cursor-pointer transition-colors ${modelConfig.model === model.name ? 'ring-2 ring-blue-500 bg-blue-50' : 'hover:bg-gray-50'}`}
                             onClick={() => setModelConfig(prev => ({ ...prev, model: model.name }))}
                           >
                             <h3 className="font-bold">{model.name}</h3>
@@ -854,14 +695,8 @@ export default function Home() {
                     </div>
                   )}
                 </div>
-
                 <div className="mt-6 flex justify-end">
-                  <button
-                    onClick={() => setShowModelSettings(false)}
-                    className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
-                  >
-                    Done
-                  </button>
+                  <button onClick={() => setShowModelSettings(false)} className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-md hover:bg-blue-700">Done</button>
                 </div>
               </div>
             </div>
@@ -879,51 +714,6 @@ export default function Home() {
             </div>
           ) : showSummary && (
             <div className="max-w-4xl mx-auto p-6">
-              {summaryResponse && (
-                <div className="fixed bottom-0 left-0 right-0 bg-white shadow-lg p-4 max-h-1/3 overflow-y-auto">
-                  <h3 className="text-lg font-semibold mb-2">Meeting Summary</h3>
-                  <div className="grid grid-cols-2 gap-4">
-                    <div className="bg-white p-4 rounded-lg shadow-sm">
-                      <h4 className="font-medium mb-1">Key Points</h4>
-                      <ul className="list-disc pl-4">
-                        {summaryResponse.summary.key_points.blocks.map((block, i) => (
-                          <li key={i} className="text-sm">{block.content}</li>
-                        ))}
-                      </ul>
-                    </div>
-                    <div className="bg-white p-4 rounded-lg shadow-sm mt-4">
-                      <h4 className="font-medium mb-1">Action Items</h4>
-                      <ul className="list-disc pl-4">
-                        {summaryResponse.summary.action_items.blocks.map((block, i) => (
-                          <li key={i} className="text-sm">{block.content}</li>
-                        ))}
-                      </ul>
-                    </div>
-                    <div className="bg-white p-4 rounded-lg shadow-sm mt-4">
-                      <h4 className="font-medium mb-1">Decisions</h4>
-                      <ul className="list-disc pl-4">
-                        {summaryResponse.summary.decisions.blocks.map((block, i) => (
-                          <li key={i} className="text-sm">{block.content}</li>
-                        ))}
-                      </ul>
-                    </div>
-                    <div className="bg-white p-4 rounded-lg shadow-sm mt-4">
-                      <h4 className="font-medium mb-1">Main Topics</h4>
-                      <ul className="list-disc pl-4">
-                        {summaryResponse.summary.main_topics.blocks.map((block, i) => (
-                          <li key={i} className="text-sm">{block.content}</li>
-                        ))}
-                      </ul>
-                    </div>
-                  </div>
-                  {summaryResponse.raw_summary ? (
-                    <div className="mt-4">
-                      <h4 className="font-medium mb-1">Full Summary</h4>
-                      <p className="text-sm whitespace-pre-wrap">{summaryResponse.raw_summary}</p>
-                    </div>
-                  ) : null}
-                </div>
-              )}
               <div className="flex-1 overflow-y-auto p-4">
                 <AISummary 
                   summary={aiSummary} 
