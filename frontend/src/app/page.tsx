@@ -1,15 +1,12 @@
 'use client';
 
-import { useState, useEffect, useContext, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { Transcript, Summary, SummaryResponse } from '@/types';
 import { EditableTitle } from '@/components/EditableTitle';
-import { TranscriptView } from '@/components/TranscriptView';
 import { RecordingControls } from '@/components/RecordingControls';
 import { AISummary } from '@/components/AISummary';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { listen } from '@tauri-apps/api/event';
-import { writeTextFile } from '@tauri-apps/plugin-fs';
-import { downloadDir } from '@tauri-apps/api/path';
 import { invoke } from '@tauri-apps/api/core';
 
 // Danh sách ngôn ngữ hỗ trợ
@@ -38,6 +35,9 @@ interface TranscriptUpdate {
   text: string;
   timestamp: string;
   source: string;
+  t0?: number;
+  t1?: number;
+  seq?: number;
 }
 
 interface ModelConfig {
@@ -55,9 +55,40 @@ interface OllamaModel {
   modified: string;
 }
 
+interface TranslatedSegment {
+  timestamp: string;
+  original: string;
+  translated: string;
+  t0: number;
+  t1: number;
+  speaker?: string;
+}
+
+// 🔥 CẬP NHẬT: Thêm trường isVerified
+interface TranscriptWithSpeaker extends Transcript {
+  t0: number;
+  t1: number;
+  speaker?: string;
+  seq?: number;
+  isVerified?: boolean;
+}
+
+interface SpeakerMap {
+  speaker_id: string;
+  name: string;
+  email: string;
+}
+
 export default function Home() {
   const [isRecording, setIsRecording] = useState(false);
-  const [transcripts, setTranscripts] = useState<Transcript[]>([]);
+  const [transcripts, setTranscripts] = useState<TranscriptWithSpeaker[]>([]);
+  
+  // Buffer & Refs cho ghép câu
+  const transcriptBufferRef = useRef<TranscriptWithSpeaker[]>([]);
+  const bufferTimerRef = useRef<number | null>(null);
+  const transcriptsRef = useRef<TranscriptWithSpeaker[]>([]);
+  const FLUSH_TIMEOUT_MS = 1000;
+  
   const [showSummary, setShowSummary] = useState(false);
   const [summaryStatus, setSummaryStatus] = useState<SummaryStatus>('idle');
   const [barHeights, setBarHeights] = useState(['58%', '76%', '58%']);
@@ -69,8 +100,6 @@ export default function Home() {
     decisions: { title: "Decisions", blocks: [] },
     main_topics: { title: "Main Topics", blocks: [] }
   });
-  const [summaryResponse, setSummaryResponse] = useState<SummaryResponse | null>(null);
-  const [isCollapsed, setIsCollapsed] = useState(false);
   const [summaryError, setSummaryError] = useState<string | null>(null);
   const [modelConfig, setModelConfig] = useState<ModelConfig>({
     provider: 'ollama',
@@ -83,18 +112,33 @@ export default function Home() {
 
   // State cho dịch
   const [targetLanguage, setTargetLanguage] = useState('en');
-  const [translatedSegments, setTranslatedSegments] = useState<{ timestamp: string; original: string; translated: string }[]>([]);
+  const [translatedSegments, setTranslatedSegments] = useState<TranslatedSegment[]>([]);
   const [isTranslating, setIsTranslating] = useState(false);
   const [detectedLanguage, setDetectedLanguage] = useState<string>('auto');
 
-  // State cho thời gian tương đối
-  const [startRecordingTime, setStartRecordingTime] = useState<Date | null>(null);
+  // State cho diarization
+  const [lastAudioFile, setLastAudioFile] = useState<string | null>(null);
+  const [isDiarizing, setIsDiarizing] = useState(false);
+  const [enableDiarization, setEnableDiarization] = useState(true);
+
+  // State cho Speaker Mapping
+  const [speakerMaps, setSpeakerMaps] = useState<SpeakerMap[]>([]);
+  const [showSpeakerModal, setShowSpeakerModal] = useState(false);
+  const [editingSpeakerId, setEditingSpeakerId] = useState<string>('');
+  const [speakerForm, setSpeakerForm] = useState({ name: '', email: '' });
+
+  const isStoppingRef = useRef(false);
 
   const modelOptions = {
     ollama: models.map(model => model.name),
     claude: ['claude-3-5-sonnet-latest'],
     groq: ['llama-3.3-70b-versatile'],
   };
+
+  // Đồng bộ refs
+  useEffect(() => {
+    transcriptsRef.current = transcripts;
+  }, [transcripts]);
 
   useEffect(() => {
     if (models.length > 0 && modelConfig.provider === 'ollama') {
@@ -104,6 +148,52 @@ export default function Home() {
       }));
     }
   }, [models]);
+
+  // Functions cho Speaker Mapping
+  const fetchSpeakers = useCallback(async () => {
+    try {
+      const res = await fetch('http://localhost:5167/speakers');
+      const data = await res.json();
+      if (data.speakers) setSpeakerMaps(data.speakers);
+    } catch (err) {
+      console.error('Lỗi khi tải danh bạ speaker:', err);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchSpeakers();
+  }, [fetchSpeakers]);
+
+  const getSpeakerDisplayName = useCallback((speakerId: string): string => {
+    const mapped = speakerMaps.find(s => s.speaker_id === speakerId);
+    if (mapped) return mapped.name;
+    if (!speakerId || speakerId === 'UNKNOWN') return '[?]';
+    if (speakerId.startsWith('SPEAKER_')) {
+      return speakerId.replace('SPEAKER_', 'Người ');
+    }
+    return speakerId;
+  }, [speakerMaps]);
+
+  const handleSaveSpeaker = async () => {
+    if (!speakerForm.name.trim()) return;
+    
+    try {
+      await fetch('http://localhost:5167/speakers/map', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          speaker_id: editingSpeakerId,
+          name: speakerForm.name,
+          email: speakerForm.email,
+        }),
+      });
+      await fetchSpeakers();
+      setShowSpeakerModal(false);
+      setSpeakerForm({ name: '', email: '' });
+    } catch (err) {
+      console.error('Lỗi khi lưu speaker:', err);
+    }
+  };
 
   const whisperModels = [
     'tiny', 'tiny.en', 'tiny-q5_1', 'tiny.en-q5_1', 'tiny-q8_0',
@@ -117,29 +207,90 @@ export default function Home() {
   const [showModelSettings, setShowModelSettings] = useState(false);
   const { setCurrentMeeting } = useSidebar();
 
-  // Format thời gian tương đối từ lúc bắt đầu ghi
-  const formatRelativeTime = useCallback((timestamp: string) => {
-    if (!startRecordingTime) return '0:00';
-    
-    try {
-      const absoluteTime = new Date(timestamp);
-      const diffMs = absoluteTime.getTime() - startRecordingTime.getTime();
-      
-      // Nếu timestamp trước thời gian bắt đầu (do lỗi), trả về 0:00
-      if (diffMs < 0) return '0:00';
-      
-      const totalSeconds = Math.floor(diffMs / 1000);
-      const minutes = Math.floor(totalSeconds / 60);
-      const seconds = totalSeconds % 60;
-      
-      return `${minutes}:${seconds.toString().padStart(2, '0')}`;
-    } catch {
-      return '0:00';
-    }
-  }, [startRecordingTime]);
+  const formatTimeFromSeconds = (seconds: number): string => {
+    if (seconds < 0) return '0:00';
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+  };
 
-  // Hàm dịch một đoạn text
-  const translateSegment = useCallback(async (text: string, timestamp: string) => {
+  const getSpeakerColor = (speaker: string): string => {
+    if (!speaker || speaker === 'UNKNOWN') return 'bg-gray-100 text-gray-500';
+    
+    const colors = [
+      'bg-blue-100 text-blue-700',
+      'bg-green-100 text-green-700',
+      'bg-purple-100 text-purple-700',
+      'bg-orange-100 text-orange-700',
+      'bg-pink-100 text-pink-700',
+      'bg-indigo-100 text-indigo-700',
+      'bg-teal-100 text-teal-700',
+      'bg-rose-100 text-rose-700',
+      'bg-amber-100 text-amber-700',
+      'bg-cyan-100 text-cyan-700',
+    ];
+    
+    const match = speaker.match(/\d+/);
+    const index = match ? parseInt(match[0]) % colors.length : 0;
+    return colors[index];
+  };
+
+  const flushTranscriptBuffer = useCallback(() => {
+    const buffer = transcriptBufferRef.current;
+    if (!buffer.length) return;
+
+    if (bufferTimerRef.current) {
+      clearTimeout(bufferTimerRef.current);
+      bufferTimerRef.current = null;
+    }
+
+    setTranscripts(prev => {
+      const combined = [...prev, ...buffer].sort((a, b) => a.t0 - b.t0);
+
+      const result: TranscriptWithSpeaker[] = [];
+      for (const seg of combined) {
+        if (result.length === 0) {
+          result.push({ ...seg });
+          continue;
+        }
+
+        const last = result[result.length - 1];
+
+        if (Math.abs(seg.t0 - last.t0) < 0.5) {
+          continue;
+        }
+
+        const segFirstChar = seg.text.trim().charAt(0);
+        const lastTrim = last.text.trim();
+        const lastEndsWithPunct = /[.!?…]$/.test(lastTrim);
+
+        if (
+          segFirstChar &&
+          segFirstChar === segFirstChar.toLowerCase() &&
+          !lastEndsWithPunct
+        ) {
+          last.text = `${last.text} ${seg.text}`.trim();
+          last.t1 = seg.t1;
+        } else {
+          result.push({ ...seg });
+        }
+      }
+
+      transcriptsRef.current = result;
+      return result;
+    });
+
+    transcriptBufferRef.current = [];
+  }, []);
+
+  const translateWithRetry = useCallback(async (
+    text: string, 
+    timestamp: string, 
+    t0: number, 
+    t1: number, 
+    speaker?: string, 
+    retryCount: number = 0
+  ): Promise<TranslatedSegment | null> => {
     if (!text || text.trim() === '') return null;
     
     try {
@@ -149,42 +300,135 @@ export default function Home() {
         body: JSON.stringify({
           text: text,
           target_lang: targetLanguage,
-          source_lang: 'auto'
+          source_lang: 'auto',
+          sequence: Math.floor(t0 * 100)
         })
       });
+      
+      if (response.status === 429 && retryCount < 3) {
+        await new Promise(resolve => setTimeout(resolve, 2000 * (retryCount + 1)));
+        return translateWithRetry(text, timestamp, t0, t1, speaker, retryCount + 1);
+      }
       
       if (!response.ok) throw new Error(`Translation API error: ${response.status}`);
       
       const data = await response.json();
-      return { original: text, translated: data.translated, timestamp };
-    } catch (error) {
-      console.error('Translation error:', error);
-      return { original: text, translated: '[Translation failed]', timestamp };
+      return { original: text, translated: data.translated, timestamp, t0, t1, speaker };
+    } catch (err) {
+      console.error('Translation error:', err);
+      return { original: text, translated: '[Translation failed]', timestamp, t0, t1, speaker };
     }
   }, [targetLanguage]);
 
-  // Dịch tất cả các đoạn transcript mới
+  // Dịch tất cả
   useEffect(() => {
     const translateAllSegments = async () => {
       if (transcripts.length === 0) {
         setTranslatedSegments([]);
         return;
       }
-      
-      setIsTranslating(true);
-      const results = await Promise.all(
-        transcripts.map(async (t) => {
-          const existing = translatedSegments.find(s => s.timestamp === t.timestamp);
-          if (existing) return existing;
-          return await translateSegment(t.text, t.timestamp);
-        })
+
+      const toTranslate = transcripts.filter(
+        t => !translatedSegments.find(s => s.timestamp === t.timestamp)
       );
-      setTranslatedSegments(results.filter(r => r !== null) as any);
+
+      if (toTranslate.length === 0) {
+        setIsTranslating(false);
+        return;
+      }
+
+      setIsTranslating(true);
+
+      const BATCH_SIZE = 5;
+      const newResults: TranslatedSegment[] = [];
+
+      for (let i = 0; i < toTranslate.length; i += BATCH_SIZE) {
+        const batch = toTranslate.slice(i, i + BATCH_SIZE);
+        const batchResults = await Promise.all(
+          batch.map(t => translateWithRetry(t.text, t.timestamp, t.t0, t.t1, t.speaker))
+        );
+        const validResults = batchResults.filter((r): r is TranslatedSegment => r !== null);
+        newResults.push(...validResults);
+
+        if (i + BATCH_SIZE < toTranslate.length) {
+          await new Promise(resolve => setTimeout(resolve, 300));
+        }
+      }
+
+      setTranslatedSegments(prev => {
+        const merged = [...prev];
+        for (const newSeg of newResults) {
+          if (!merged.find(s => s.timestamp === newSeg.timestamp)) {
+            merged.push(newSeg);
+          }
+        }
+        return merged.sort((a, b) => a.t0 - b.t0);
+      });
+
       setIsTranslating(false);
     };
-    
+
     translateAllSegments();
-  }, [transcripts, targetLanguage, translateSegment]);
+  }, [transcripts, targetLanguage, translateWithRetry]);
+
+  // 🔥 HÀM DIARIZATION MỚI: Ghi đè hoàn toàn bằng bản chuẩn từ WhisperX
+  // 🔥 QUAN TRỌNG: Đã sửa seg.speaker thành seg.speaker_id
+  const runDiarization = useCallback(async (audioFilePath: string) => {
+    if (!enableDiarization) {
+      console.log("Diarization disabled, skipping");
+      return;
+    }
+    
+    setIsDiarizing(true);
+    
+    try {
+      console.log("🚀 Đang gửi file lên Backend để tinh chỉnh (WhisperX + Diarization):", audioFilePath);
+      
+      const response = await fetch('http://localhost:5167/diarize-local', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ file_path: audioFilePath }),
+      });
+      
+      if (!response.ok) {
+        throw new Error(`Diarization failed: ${response.status}`);
+      }
+      
+      const result = await response.json();
+      console.log("✅ Kết quả WhisperX nhận được:", result);
+      
+      if (result.segments && result.segments.length > 0) {
+        // 🔥 BIẾN ĐỔI: Chuyển dữ liệu chuẩn từ Backend thành định dạng hiển thị
+        // 🔥 SỬA LỖI: Dùng 'speaker_id' thay vì 'speaker'
+        const finalTranscripts: TranscriptWithSpeaker[] = result.segments.map((seg: any, index: number) => ({
+          id: `final-${index}-${Date.now()}`,
+          text: seg.text.trim(),
+          timestamp: formatTimeFromSeconds(seg.start),
+          t0: seg.start,
+          t1: seg.end,
+          speaker: seg.speaker_id || "UNKNOWN",  // 🔥 ĐÃ SỬA: speaker_id
+          seq: index,
+          isVerified: true  // 🔥 Đánh dấu là bản chuẩn
+        }));
+
+        // 🔥 GHI ĐÈ HOÀN TOÀN: Xóa bỏ bản nháp, thay bằng bản chuẩn
+        setTranscripts(finalTranscripts);
+        transcriptsRef.current = finalTranscripts;
+        
+        // Xóa sạch buffer để tránh bị lẫn dữ liệu cũ
+        transcriptBufferRef.current = [];
+        if (bufferTimerRef.current) {
+          clearTimeout(bufferTimerRef.current);
+          bufferTimerRef.current = null;
+        }
+      }
+    } catch (err) {
+      const error = err as { name?: string; message?: string };
+      console.error("❌ Lỗi xử lý bản chuẩn:", error.message || error);
+    } finally {
+      setIsDiarizing(false);
+    }
+  }, [enableDiarization]);
 
   useEffect(() => {
     setCurrentMeeting({ id: 'intro-call', title: meetingTitle });
@@ -205,40 +449,67 @@ export default function Home() {
     }
   }, [isRecording]);
 
+  // Listener cho transcript update
   useEffect(() => {
     let unlistenFn: (() => void) | undefined;
-    let transcriptCounter = 0;
 
     const setupListener = async () => {
       try {
         unlistenFn = await listen<TranscriptUpdate>('transcript-update', (event) => {
-          const newTranscript = {
-            id: `${Date.now()}-${transcriptCounter++}`,
-            text: event.payload.text,
-            timestamp: event.payload.timestamp,
+          const payload = event.payload;
+          const t0 = payload.t0 ?? 0;
+          const t1 = payload.t1 ?? 0;
+          const seq = payload.seq ?? 0;
+
+          console.log(`📝 [FRONTEND] Received: seq=${seq}, t0=${t0.toFixed(2)}s, text="${payload.text.substring(0, 50)}..."`);
+          
+          const newTranscript: TranscriptWithSpeaker = {
+            id: `${seq}-${Date.now()}`,
+            text: payload.text,
+            timestamp: payload.timestamp,
+            t0: t0,
+            t1: t1,
+            speaker: undefined,
+            seq: seq,
+            isVerified: false  // Bản nháp real-time
           };
-          setTranscripts(prev => {
-            const exists = prev.some(
-              t => t.text === event.payload.text && t.timestamp === event.payload.timestamp
-            );
-            return exists ? prev : [...prev, newTranscript];
-          });
+          
+          const existsInBuffer = transcriptBufferRef.current.some(s => s.seq === seq);
+          const existsInTranscripts = transcriptsRef.current.some(s => s.seq === seq);
+
+          if (existsInBuffer || existsInTranscripts) {
+            console.log(`⏭️ Bỏ qua tin trùng: seq=${seq}`);
+            return;
+          }
+
+          transcriptBufferRef.current.push(newTranscript);
+
+          if (bufferTimerRef.current) {
+            clearTimeout(bufferTimerRef.current);
+          }
+          bufferTimerRef.current = window.setTimeout(() => {
+            flushTranscriptBuffer();
+            bufferTimerRef.current = null;
+          }, FLUSH_TIMEOUT_MS);
         });
-      } catch (error) {
-        console.error('Failed to setup transcript listener:', error);
+      } catch (err) {
+        console.error('Failed to setup transcript listener:', err);
       }
     };
     setupListener();
-    return () => { if (unlistenFn) unlistenFn(); };
-  }, []);
+    return () => { 
+      if (unlistenFn) unlistenFn(); 
+      if (bufferTimerRef.current) {
+        clearTimeout(bufferTimerRef.current);
+        bufferTimerRef.current = null;
+      }
+    };
+  }, [flushTranscriptBuffer]);
 
   useEffect(() => {
     const loadModels = async () => {
       try {
-        const response = await fetch('http://localhost:11434/api/tags', {
-          method: 'GET',
-          headers: { 'Content-Type': 'application/json' },
-        });
+        const response = await fetch('http://localhost:11434/api/tags');
         if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
         const data = await response.json();
         const modelList = data.models.map((model: any) => ({
@@ -264,9 +535,6 @@ export default function Home() {
 
   const handleRecordingStart = async () => {
     try {
-      // Lưu thời điểm bắt đầu ghi
-      setStartRecordingTime(new Date());
-      
       const { invoke } = await import('@tauri-apps/api/core');
       const isCurrentlyRecording = await invoke('is_recording');
       if (isCurrentlyRecording) await handleRecordingStop();
@@ -275,60 +543,91 @@ export default function Home() {
       setTranscripts([]);
       setTranslatedSegments([]);
       setDetectedLanguage('auto');
-    } catch (error) {
-      console.error('Failed to start recording:', error);
+      setLastAudioFile(null);
+      transcriptBufferRef.current = [];
+      if (bufferTimerRef.current) {
+        clearTimeout(bufferTimerRef.current);
+        bufferTimerRef.current = null;
+      }
+    } catch (err) {
+      console.error('Failed to start recording:', err);
       alert('Failed to start recording. Check console for details.');
       setIsRecording(false);
-      setStartRecordingTime(null);
     }
   };
 
+  // 🔥 HÀNH LẠI: handleRecordingStop với cơ chế bản nháp → bản chuẩn
   const handleRecordingStop = async () => {
+    if (isStoppingRef.current) {
+      console.log("Đang xử lý stop, vui lòng đợi...");
+      return;
+    }
+    
+    isStoppingRef.current = true;
+    
+    // 🔥 ĐỔI TRẠNG THÁI NGAY LẬP TỨC
+    setIsRecording(false);
+    
     try {
       const { invoke } = await import('@tauri-apps/api/core');
       const { appDataDir } = await import('@tauri-apps/api/path');
       const dataDir = await appDataDir();
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const transcriptPath = `${dataDir}transcript-${timestamp}.txt`;
-      const audioPath = `${dataDir}recording-${timestamp}.wav`;
-      await invoke('stop_recording', { args: { save_path: audioPath, model_config: modelConfig } });
       
-      const formattedTranscript = transcripts
-        .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
-        .map(t => `[${formatRelativeTime(t.timestamp)}] ${t.text}`)
-        .join('\n\n');
-      const documentContent = `Meeting Title: ${meetingTitle}\nDate: ${new Date().toLocaleString()}\n\nTranscript:\n${formattedTranscript}`;
-      await invoke('save_transcript', { filePath: transcriptPath, content: documentContent });
-      setIsRecording(false);
-      setStartRecordingTime(null); // Reset thời gian bắt đầu
-      if (formattedTranscript.trim()) setShowSummary(true);
-    } catch (error) {
-      console.error('Failed to stop recording:', error);
-      alert('Failed to stop recording. Check console for details.');
-      setIsRecording(false);
-      setStartRecordingTime(null);
+      const uniqueId = Date.now();
+      const audioPath = `${dataDir}recording-${uniqueId}.wav`;
+      
+      console.log("🛑 Gửi lệnh stop sang Rust với path:", audioPath);
+      
+      // 1. Dừng ghi âm và lưu file
+      await invoke('stop_recording', { savePath: audioPath });
+
+      // 2. Ép buffer real-time xả nốt những chữ cuối cùng ra màn hình
+      if (transcriptBufferRef.current.length > 0) {
+        flushTranscriptBuffer();
+      }
+      
+      // Đợi file WAV đóng hoàn toàn
+      console.log("⏳ Chờ file WAV đóng (2s)...");
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      
+      setLastAudioFile(audioPath);
+
+      // 3. Nếu bật Diarization, tiến hành chạy bản chuẩn đè lên
+      if (enableDiarization) {
+        console.log("🚀 Gọi AI nhận diện người nói cho file:", audioPath);
+        await runDiarization(audioPath);
+      }
+      
+      // 4. Hiện màn hình tóm tắt
+      setShowSummary(true);
+      
+    } catch (err) {
+      console.error('Failed to stop recording:', err);
+      alert('Lỗi khi dừng ghi âm. Xem console để biết chi tiết.');
+    } finally {
+      isStoppingRef.current = false;
     }
   };
 
   const handleTranscriptUpdate = (update: any) => {
-    const newTranscript = {
-      id: Date.now().toString(),
-      text: update.text,
-      timestamp: update.timestamp,
-    };
-    setTranscripts(prev => {
-      const exists = prev.some(t => t.text === update.text && t.timestamp === update.timestamp);
-      return exists ? prev : [...prev, newTranscript];
-    });
+    console.log('Transcript update received:', update);
   };
 
   const generateAISummary = useCallback(async () => {
     setSummaryStatus('processing');
     setSummaryError(null);
     try {
-      const fullTranscript = transcripts.map(t => t.text).join('\n');
+      const fullTranscript = [...transcripts]
+        .sort((a, b) => a.t0 - b.t0)
+        .map(t => {
+          const speakerName = getSpeakerDisplayName(t.speaker || 'UNKNOWN');
+          return `[${speakerName}] ${formatTimeFromSeconds(t.t0)} - ${formatTimeFromSeconds(t.t1)}: ${t.text}`;
+        })
+        .join('\n');
+      
       if (!fullTranscript.trim()) throw new Error('No transcript text available.');
       setOriginalTranscript(fullTranscript);
+      
       const response = await fetch('http://localhost:5167/process-transcript', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -370,16 +669,16 @@ export default function Home() {
             setAiSummary(formattedSummary);
             setSummaryStatus('completed');
           }
-        } catch (error) {
+        } catch (err) {
           clearInterval(pollInterval);
           setSummaryStatus('error');
         }
       }, 5000);
       return () => clearInterval(pollInterval);
-    } catch (error) {
+    } catch (err) {
       setSummaryStatus('error');
     }
-  }, [transcripts, modelConfig]);
+  }, [transcripts, modelConfig, getSpeakerDisplayName]);
 
   const handleTitleChange = (newTitle: string) => {
     setMeetingTitle(newTitle);
@@ -399,11 +698,15 @@ export default function Home() {
   };
 
   const handleCopyTranscript = useCallback(() => {
-    const fullTranscript = transcripts
-      .map(t => `[${formatRelativeTime(t.timestamp)}] ${t.text}`)
+    const fullTranscript = [...transcripts]
+      .sort((a, b) => a.t0 - b.t0)
+      .map(t => {
+        const speakerName = getSpeakerDisplayName(t.speaker || 'UNKNOWN');
+        return `[${speakerName}] ${formatTimeFromSeconds(t.t0)}: ${t.text}`;
+      })
       .join('\n');
     navigator.clipboard.writeText(fullTranscript);
-  }, [transcripts, formatRelativeTime]);
+  }, [transcripts, getSpeakerDisplayName]);
 
   const handleGenerateSummary = useCallback(async () => {
     if (!transcripts.length) return;
@@ -456,23 +759,18 @@ export default function Home() {
             setAiSummary(formattedSummary);
             setSummaryStatus('completed');
           }
-        } catch (error) {
+        } catch (err) {
           clearInterval(pollInterval);
           setSummaryStatus('error');
         }
       }, 10000);
       return () => clearInterval(pollInterval);
-    } catch (error) {
+    } catch (err) {
       setSummaryStatus('error');
     }
   }, [originalTranscript, modelConfig]);
 
   const isSummaryLoading = summaryStatus === 'processing' || summaryStatus === 'summarizing' || summaryStatus === 'regenerating';
-
-  const getLanguageName = (code: string) => {
-    const lang = SUPPORTED_LANGUAGES.find(l => l.code === code);
-    return lang ? lang.name : code;
-  };
 
   return (
     <div className="flex flex-col h-screen bg-gray-50">
@@ -492,7 +790,7 @@ export default function Home() {
                 />
               </div>
 
-              {/* Hàng nút Copy và Generate */}
+              {/* Buttons row */}
               <div className="flex items-center space-x-2">
                 <button
                   onClick={handleCopyTranscript}
@@ -552,7 +850,7 @@ export default function Home() {
                 )}
               </div>
 
-              {/* Translation selector - nằm dưới hàng nút */}
+              {/* Translation selector */}
               <div className="flex items-center gap-2 p-2 bg-gradient-to-r from-blue-50 to-indigo-50 rounded-lg border border-blue-200">
                 <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 text-blue-600 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                   <path strokeLinecap="round" strokeLinejoin="round" d="M3 5h12M9 3v2m1.048 9.5A18.022 18.022 0 016.412 9m6.088 9h7M11 21l5-10 5 10M12.751 5C11.783 10.77 8.07 15.61 3 18.129" />
@@ -578,29 +876,79 @@ export default function Home() {
                   </div>
                 )}
               </div>
+
+              {/* Diarization toggle */}
+              <div className="flex items-center gap-2 mt-1">
+                <input
+                  type="checkbox"
+                  id="enableDiarization"
+                  checked={enableDiarization}
+                  onChange={(e) => setEnableDiarization(e.target.checked)}
+                  className="w-3.5 h-3.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                />
+                <label htmlFor="enableDiarization" className="text-xs text-gray-600">
+                  Phân biệt người nói (chậm hơn)
+                </label>
+                {isDiarizing && (
+                  <div className="flex items-center gap-1 ml-2">
+                    <svg className="animate-spin h-3 w-3 text-blue-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                    <span className="text-xs text-blue-500">Đang phân tích...</span>
+                  </div>
+                )}
+              </div>
             </div>
           </div>
 
-          {/* Transcript content - HIỂN THỊ GỐC, HOVER MỚI HIỆN DỊCH */}
+          {/* Transcript content */}
           <div className="flex-1 overflow-y-auto pb-32">
             {transcripts.length > 0 ? (
               <div className="p-3 space-y-3">
-                {transcripts.map((item, idx) => {
+                {[...transcripts].sort((a, b) => a.t0 - b.t0).map((item) => {
                   const translatedItem = translatedSegments.find(s => s.timestamp === item.timestamp);
+                  const displayName = getSpeakerDisplayName(item.speaker || 'UNKNOWN');
+                  const speakerColor = getSpeakerColor(item.speaker || '');
+                  
                   return (
                     <div key={item.id} className="relative">
                       <div className="flex items-start gap-2">
                         <span className="text-[10px] font-mono text-gray-400 whitespace-nowrap mt-0.5">
-                          {formatRelativeTime(item.timestamp)}
+                          {formatTimeFromSeconds(item.t0)}
                         </span>
                         <div className="flex-1">
-                          {/* Nội dung gốc - hover vào đây để hiện dịch */}
                           <div className="group w-full">
+                            <div className="flex items-center gap-2 mb-0.5">
+                              <button 
+                                onClick={() => {
+                                  const sId = item.speaker || 'UNKNOWN';
+                                  setEditingSpeakerId(sId);
+                                  const existing = speakerMaps.find(s => s.speaker_id === sId);
+                                  setSpeakerForm({
+                                    name: existing ? existing.name : '',
+                                    email: existing ? existing.email : ''
+                                  });
+                                  setShowSpeakerModal(true);
+                                }}
+                                className={`text-[10px] font-semibold px-2 py-0.5 rounded-full cursor-pointer hover:opacity-80 transition-all border border-transparent hover:border-current ${speakerColor} ${!item.speaker ? 'bg-gray-100 text-gray-400' : ''}`}
+                                title="Nhấn để định danh người này"
+                              >
+                                {displayName}
+                              </button>
+                              {/* 🔥 BADGE VERIFIED: Hiển thị nếu là bản chuẩn từ WhisperX */}
+                              {item.isVerified && (
+                                <span title="Đã tinh chỉnh bởi WhisperX" className="text-blue-500">
+                                  <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3" viewBox="0 0 20 20" fill="currentColor">
+                                    <path fillRule="evenodd" d="M6.267 3.455a3.066 3.066 0 001.745-.723 3.066 3.066 0 013.976 0 3.066 3.066 0 001.745.723 3.066 3.066 0 012.812 2.812c.051.64.304 1.24.723 1.745a3.066 3.066 0 010 3.976 3.066 3.066 0 00-.723 1.745 3.066 3.066 0 01-2.812 2.812 3.066 3.066 0 00-1.745.723 3.066 3.066 0 01-3.976 0 3.066 3.066 0 00-1.745-.723 3.066 3.066 0 01-2.812-2.812 3.066 3.066 0 00-.723-1.745 3.066 3.066 0 010-3.976 3.066 3.066 0 00.723-1.745 3.066 3.066 0 012.812-2.812zm7.44 5.252a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                                  </svg>
+                                </span>
+                              )}
+                            </div>
                             <p className="text-sm text-gray-700 leading-relaxed p-1 -m-1 rounded cursor-pointer transition-all duration-150 group-hover:bg-gray-100">
                               {item.text}
                             </p>
-                            {/* Nội dung dịch - chỉ hiện khi hover vào group */}
-                            {translatedItem && translatedItem.translated && (
+                            {translatedItem && translatedItem.translated && translatedItem.translated !== '[Translation failed]' && (
                               <div className="overflow-hidden transition-all duration-200 max-h-0 group-hover:max-h-24 group-hover:mt-2">
                                 <div className="pt-1">
                                   <p className="text-sm text-blue-600 leading-relaxed border-l-2 border-blue-300 pl-2">
@@ -701,6 +1049,75 @@ export default function Home() {
               </div>
             </div>
           )}
+
+          {/* ==================== MODAL ĐỔI TÊN SPEAKER ==================== */}
+          {showSpeakerModal && (
+            <div className="fixed inset-0 bg-black bg-opacity-40 flex items-center justify-center z-[60] backdrop-blur-sm">
+              <div className="bg-white rounded-xl p-6 max-w-sm w-full mx-4 shadow-2xl transform transition-all">
+                <div className="flex justify-between items-center mb-5">
+                  <h3 className="text-lg font-bold text-gray-900">
+                    Định danh {editingSpeakerId}
+                  </h3>
+                  <button onClick={() => setShowSpeakerModal(false)} className="text-gray-400 hover:text-gray-600 bg-gray-100 hover:bg-gray-200 rounded-full p-1 transition-colors">
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                      <path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" />
+                    </svg>
+                  </button>
+                </div>
+                
+                <div className="space-y-4">
+                  <div>
+                    <label className="block text-sm font-semibold text-gray-700 mb-1">Tên hiển thị</label>
+                    <input
+                      type="text"
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all"
+                      placeholder="VD: Nguyễn Văn A"
+                      value={speakerForm.name}
+                      onChange={(e) => setSpeakerForm({...speakerForm, name: e.target.value})}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && speakerForm.name.trim()) {
+                          handleSaveSpeaker();
+                        }
+                      }}
+                      autoFocus
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-semibold text-gray-700 mb-1">Email (Tùy chọn cho AI gửi thư)</label>
+                    <input
+                      type="email"
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all"
+                      placeholder="VD: a@gmail.com"
+                      value={speakerForm.email}
+                      onChange={(e) => setSpeakerForm({...speakerForm, email: e.target.value})}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && speakerForm.name.trim()) {
+                          handleSaveSpeaker();
+                        }
+                      }}
+                    />
+                  </div>
+                </div>
+
+                <div className="mt-6 flex justify-end gap-3">
+                  <button 
+                    onClick={() => setShowSpeakerModal(false)} 
+                    className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200 transition-colors"
+                  >
+                    Hủy
+                  </button>
+                  <button 
+                    onClick={handleSaveSpeaker} 
+                    disabled={!speakerForm.name.trim()}
+                    className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 disabled:bg-blue-300 disabled:cursor-not-allowed transition-colors shadow-sm"
+                  >
+                    Lưu danh bạ
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+          {/* ========================================================== */}
         </div>
 
         {/* Right side - AI Summary */}

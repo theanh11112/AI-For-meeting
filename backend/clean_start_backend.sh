@@ -14,6 +14,8 @@ NC='\033[0m' # No Color
 # Configuration
 PACKAGE_NAME="whisper-server-package"
 MODEL_DIR="$PACKAGE_NAME/models"
+WHISPER_PORT=8178
+BACKEND_PORT=5167
 
 # Helper functions for logging
 log_info() {
@@ -52,8 +54,8 @@ cleanup() {
         log_info "Stopping Whisper server..."
         if kill -0 $WHISPER_PID 2>/dev/null; then
             kill -9 $WHISPER_PID 2>/dev/null || log_warning "Failed to kill Whisper server process"
-            pkill -9 -f "whisper-server" 2>/dev/null || log_warning "Failed to kill remaining whisper-server processes"
         fi
+        pkill -9 -f "whisper-server" 2>/dev/null || true
         log_success "Whisper server stopped"
     fi
     if [ -n "$PYTHON_PID" ]; then
@@ -63,6 +65,9 @@ cleanup() {
         fi
         log_success "Python backend stopped"
     fi
+    # Kill any process on ports
+    lsof -ti :$WHISPER_PORT | xargs kill -9 2>/dev/null || true
+    lsof -ti :$BACKEND_PORT | xargs kill -9 2>/dev/null || true
 }
 
 # Set up trap for cleanup on script exit, interrupt, or termination
@@ -87,39 +92,19 @@ if [ ! -d "venv" ]; then
     handle_error "Virtual environment not found. Please run build_whisper.sh first"
 fi
 
-# Kill any existing whisper-server processes
+# Kill any existing processes
 log_section "Initial Cleanup"
 
 log_info "Checking for existing whisper servers..."
-if pkill -f "whisper-server" 2>/dev/null; then
-    log_success "Existing whisper servers terminated"
-else
-    log_warning "No existing whisper servers found"
-fi
-sleep 1  # Give processes time to terminate
+pkill -9 -f "whisper-server" 2>/dev/null && log_success "Existing whisper servers terminated" || log_warning "No existing whisper servers found"
 
-# Check and kill if backend app in port 5167 is running
-log_section "Backend App Check"
-
-log_info "Checking for processes on port 5167..."
-PORT=5167
-if lsof -i :$PORT | grep -q LISTEN; then
-    log_warning "Backend app is running on port $PORT"
-    read -p "$(echo -e "${YELLOW}🤔 Kill it? (y/N)${NC} ")" -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        handle_error "User chose not to terminate existing backend app"
-    fi
-
-    log_info "Terminating backend app..."
-    if ! kill -9 $(lsof -t -i :$PORT) 2>/dev/null; then
-        handle_error "Failed to terminate backend app"
-    fi
+log_info "Checking for processes on port $BACKEND_PORT..."
+if lsof -i :$BACKEND_PORT | grep -q LISTEN; then
+    log_warning "Backend app is running on port $BACKEND_PORT"
+    kill -9 $(lsof -t -i :$BACKEND_PORT) 2>/dev/null
     log_success "Backend app terminated"
-    sleep 1  # Give processes time to terminate
 fi
-
-
+sleep 2
 
 # Check for existing model
 log_section "Model Check"
@@ -185,7 +170,7 @@ fi
 MODEL_NAME="ggml-$MODEL_SHORT_NAME.bin"
 log_success "Selected model: $MODEL_NAME"
 
-# Check if the modelname exists in directory
+# Check if the model exists in directory
 if [ -f "$MODEL_DIR/$MODEL_NAME" ]; then
     log_success "Model file exists: $MODEL_DIR/$MODEL_NAME"
 else
@@ -202,55 +187,79 @@ fi
 log_section "Starting Services"
 
 # Start the whisper server in background
-log_info "Starting Whisper server... 🎙️"
+log_info "Starting Whisper server on port $WHISPER_PORT... 🎙️"
 cd "$PACKAGE_NAME" || handle_error "Failed to change to whisper-server directory"
-./run-server.sh --model "models/$MODEL_NAME" &
+./run-server.sh --model "models/$MODEL_NAME" --port $WHISPER_PORT &
 WHISPER_PID=$!
 cd .. || handle_error "Failed to return to root directory"
 
-# Wait for server to start and check if it's running
-sleep 2
+# Wait for Whisper server to start
+log_info "Waiting for Whisper server to start..."
+for i in {1..15}; do
+    if curl -s http://127.0.0.1:$WHISPER_PORT > /dev/null 2>&1; then
+        log_success "Whisper server is ready"
+        break
+    fi
+    echo "   Waiting... ($i/15)"
+    sleep 2
+done
+
 if ! kill -0 $WHISPER_PID 2>/dev/null; then
     handle_error "Whisper server failed to start"
 fi
 
 # Start the Python backend in background
-log_info "Starting Python backend... 🚀"
-# Start venv if not active
+log_info "Starting Python backend on port $BACKEND_PORT... 🚀"
+
+# Activate virtual environment
 if [ -z "$VIRTUAL_ENV" ]; then
     log_info "Activating virtual environment..."
-    if ! source venv/bin/activate; then
-        handle_error "Failed to activate virtual environment"
-    fi
+    source venv/bin/activate || handle_error "Failed to activate virtual environment"
 fi
 
 # Check if required Python packages are installed
 if ! pip show fastapi >/dev/null 2>&1; then
-    handle_error "FastAPI not found. Please run build_whisper.sh to install dependencies"
+    log_warning "FastAPI not found. Installing dependencies..."
+    pip install -r requirements.txt || handle_error "Failed to install dependencies"
 fi
 
+# Start backend
 python app/main.py &
 PYTHON_PID=$!
 
-# Wait for backend to start and check if it's running
-sleep 10
+# Wait for Python backend to start
+log_info "Waiting for Python backend to start..."
+for i in {1..30}; do
+    if curl -s http://127.0.0.1:$BACKEND_PORT/languages > /dev/null 2>&1; then
+        log_success "Python backend is ready"
+        break
+    fi
+    echo "   Waiting... ($i/30)"
+    sleep 2
+done
+
+# Check if backend is running
 if ! kill -0 $PYTHON_PID 2>/dev/null; then
     handle_error "Python backend failed to start"
 fi
 
-# Check if the port is actually listening
-if ! lsof -i :$PORT | grep -q LISTEN; then
-    handle_error "Python backend is not listening on port $PORT"
+# Final check
+if ! curl -s http://127.0.0.1:$BACKEND_PORT/languages > /dev/null 2>&1; then
+    handle_error "Python backend is not responding on port $BACKEND_PORT"
 fi
 
 log_success "🎉 All services started successfully!"
-echo -e "${GREEN}🔍 Whisper Server (PID: $WHISPER_PID)${NC}"
-echo -e "${GREEN}🐍 Python Backend (PID: $PYTHON_PID)${NC}"
-echo -e "${BLUE}Press Ctrl+C to stop all services${NC}"
+echo ""
+echo -e "${GREEN}🔍 Whisper Server (PID: $WHISPER_PID) - http://127.0.0.1:$WHISPER_PORT${NC}"
+echo -e "${GREEN}🐍 Python Backend (PID: $PYTHON_PID) - http://127.0.0.1:$BACKEND_PORT${NC}"
+echo ""
+echo -e "${BLUE}📝 API Endpoints:${NC}"
+echo -e "${BLUE}   - GET /languages${NC}"
+echo -e "${BLUE}   - POST /translate${NC}"
+echo -e "${BLUE}   - POST /diarize${NC}"
+echo -e "${BLUE}   - POST /process-transcript${NC}"
+echo ""
+echo -e "${YELLOW}Press Ctrl+C to stop all services${NC}"
 
-# Show whisper server port and python backend port
-echo -e "${BLUE}Whisper Server Port: $PORT${NC}"
-echo -e "${BLUE}Python Backend Port: 8178${NC}"
-
-# Keep the script running and wait for both processes
-wait $WHISPER_PID $PYTHON_PID || handle_error "One of the services crashed"
+# Keep the script running and wait for processes
+wait $WHISPER_PID $PYTHON_PID

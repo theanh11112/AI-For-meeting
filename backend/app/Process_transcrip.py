@@ -392,6 +392,42 @@ class TranscriptProcessor:
 
         return chunks
 
+    def merge_broken_sentences(self, text: str) -> str:
+        """
+        Merge sentence fragments that were split across chunk boundaries.
+        Strategy:
+        - Split incoming text by newlines (or obvious chunk separators).
+        - If the previous part does not end with sentence punctuation and the next part starts with a lowercase or non-punctuation,
+          join them with a space so the sentence is reassembled.
+        - Return the cleaned/merged transcript as a single string.
+        """
+        if not text:
+            return text
+
+        # Normalize line breaks and split
+        parts = [p.strip() for p in re.split(r"[\r\n]+", text) if p.strip()]
+        if not parts:
+            return text
+
+        merged_parts = []
+        for part in parts:
+            if not merged_parts:
+                merged_parts.append(part)
+                continue
+
+            prev = merged_parts[-1]
+            # If previous part does not end with terminal punctuation, and current starts with lowercase/word char,
+            # it's likely the sentence was split — merge them.
+            if not re.search(r"[.!?…]\s*$", prev) and re.match(
+                r"^[a-z0-9]", part, re.IGNORECASE
+            ):
+                merged_parts[-1] = prev + " " + part
+            else:
+                merged_parts.append(part)
+
+        # Join with single space to produce continuous text for downstream sentence splitting
+        return " ".join(merged_parts)
+
     async def process_transcript(
         self,
         text: str = None,
@@ -464,6 +500,15 @@ class TranscriptProcessor:
             # If transcript is still None or empty
             if not transcript or not transcript.strip():
                 raise ValueError("No transcript content to process")
+
+            print(f"📝 [PROCESS] Raw transcript length: {len(transcript)} chars")
+            print(f"📝 [PROCESS] First 200 chars: {transcript[:200]}...")
+
+            # ==================== THÊM: MERGE BROKEN SENTENCES ====================
+            transcript = self.merge_broken_sentences(transcript)
+            # ==================== KẾT THÚC THÊM ====================
+
+            print(f"📝 [PROCESS] After merge, length: {len(transcript)} chars")
 
             logger.info(f"Processing transcript of length {len(transcript)} characters")
             logger.debug(f"Transcript preview: {transcript[:500]}...")

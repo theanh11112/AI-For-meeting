@@ -8,12 +8,20 @@ import logging
 from datetime import datetime
 import os
 from dotenv import load_dotenv
-from db import DatabaseManager
 import asyncio
 from functools import partial
 import json
 from threading import Lock
-from Process_transcrip import (
+import uuid
+import tempfile
+import sys
+
+# Thêm thư mục backend vào Python path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# ==================== IMPORT CUSTOM MODULES ====================
+from .db import DatabaseManager
+from .Process_transcrip import (
     TranscriptProcessor,
     MeetingSummarizer,
     SummaryResponse,
@@ -23,10 +31,10 @@ from Process_transcrip import (
     Section,
     Block,
 )
-import uuid
-
-# ==================== THÊM IMPORT TRANSLATION SERVICE ====================
-from translation import TranslationService
+from .translation import TranslationService
+from .whisperx_service import WhisperXService
+from .models.user_map import meeting_directory
+from .services.speaker_mapper import map_speakers_to_real_names, get_all_speakers
 
 # Load environment variables
 load_dotenv()
@@ -53,24 +61,24 @@ if not logger.handlers:
 app = FastAPI(
     title="Meeting Summarizer API",
     description="API for processing and summarizing meeting transcripts",
-    version="1.0.0",
+    version="2.0.0",
 )
 
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:3118",  # Dev server
-        "http://localhost:*",  # Any local port
-        "tauri://localhost",  # Tauri app
-        "tauri://*",  # Any Tauri origin
-        "app://localhost",  # Tauri app in release mode
-        "app://*",  # Any app:// origin
+        "http://localhost:3118",
+        "http://localhost:*",
+        "tauri://localhost",
+        "tauri://*",
+        "app://localhost",
+        "app://*",
     ],
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all methods
+    allow_methods=["*"],
     allow_headers=["*"],
-    max_age=3600,  # Cache preflight requests for 1 hour
+    max_age=3600,
 )
 
 
@@ -90,6 +98,19 @@ class TranscriptResponse(BaseModel):
     message: str
     num_chunks: int
     data: Dict[str, Any]
+
+
+class MappingRequest(BaseModel):
+    """Request model for speaker mapping"""
+
+    speaker_id: str
+    name: str
+    email: str
+
+
+# 🔥 THÊM: Request model cho local diarization
+class LocalDiarizeRequest(BaseModel):
+    file_path: str
 
 
 class SummaryProcessor:
@@ -132,18 +153,16 @@ class SummaryProcessor:
             if not text:
                 raise ValueError("Empty transcript text provided")
 
-            # Validate chunk_size and overlap
             if chunk_size <= 0:
                 raise ValueError("chunk_size must be positive")
             if overlap < 0:
                 raise ValueError("overlap must be non-negative")
             if overlap >= chunk_size:
-                overlap = chunk_size - 1  # Ensure overlap is less than chunk_size
+                overlap = chunk_size - 1
 
-            # Ensure step size is positive
             step_size = chunk_size - overlap
             if step_size <= 0:
-                chunk_size = overlap + 1  # Adjust chunk_size to ensure positive step
+                chunk_size = overlap + 1
 
             logger.info("Initializing ChromaDB collection")
             self.transcript_processor.initialize_collection()
@@ -155,10 +174,9 @@ class SummaryProcessor:
             logger.info(
                 f"Processing transcript of length {len(text)} with chunk_size={chunk_size}, overlap={overlap}"
             )
-            # Pass text as positional arg, chunk_size and overlap as keyword args
             num_chunks, all_json_data = (
                 await self.transcript_processor.process_transcript(
-                    text=text,  # Pass as keyword arg to be explicit
+                    text=text,
                     model=model,
                     model_name=model_name,
                     chunk_size=chunk_size,
@@ -184,7 +202,6 @@ class SummaryProcessor:
                 if not self.collection:
                     raise ValueError("Failed to initialize ChromaDB collection")
 
-            # Run the agent to generate summary
             logger.info("Running agent to generate summary")
             try:
                 run_result = await self.agent.run(
@@ -199,7 +216,6 @@ class SummaryProcessor:
                     run_result.data
                 )
 
-                # Validate summary has content
                 if not any(
                     [
                         total_summary_in_pydantic.Agenda.blocks,
@@ -210,20 +226,16 @@ class SummaryProcessor:
                 ):
                     raise ValueError("No content found in summary")
 
-                # Convert to JSON using Pydantic's json() method
                 json_data = total_summary_in_pydantic.model_dump_json(indent=2)
                 raw_summary = json.loads(json_data)
 
-                # Format the summary to match the frontend Summary type
                 formatted_summary = {}
                 for section_name, section_data in raw_summary.items():
                     formatted_blocks = []
                     for block in section_data.get("blocks", []):
                         formatted_block = {
                             "id": block.get("id", str(uuid.uuid4())),
-                            "type": block.get(
-                                "type", "text"
-                            ),  # Default to 'text' if not specified
+                            "type": block.get("type", "text"),
                             "content": block.get("content", ""),
                             "color": block.get("color", "default"),
                         }
@@ -234,7 +246,6 @@ class SummaryProcessor:
                         "blocks": formatted_blocks,
                     }
 
-                # Return the result with usage information
                 result = {
                     "summary": formatted_summary,
                     "usage": {
@@ -289,8 +300,9 @@ class SummaryProcessor:
 # Initialize processor
 processor = SummaryProcessor()
 
-# ==================== KHỞI TẠO TRANSLATION SERVICE ====================
+# ==================== KHỞI TẠO SERVICES ====================
 translation_service = TranslationService()
+whisperx_service = None
 
 
 # Define tools
@@ -300,7 +312,6 @@ async def query_transcript(ctx: RunContext, query: str) -> str:
     try:
         logger.info(f"Querying transcript with: {query}")
 
-        # Check if there are any chunks left
         if not processor.collection:
             logger.error("No ChromaDB collection available")
             return "Error: No transcript loaded. Please process a transcript first."
@@ -310,7 +321,6 @@ async def query_transcript(ctx: RunContext, query: str) -> str:
             logger.info("No chunks left to process")
             return "CHROMADB_EMPTY: All chunks have been processed."
 
-        # Get unprocessed chunks
         logger.info("Querying ChromaDB for relevant chunks")
         results = processor.collection.query(query_texts=[query], n_results=1)
 
@@ -318,7 +328,6 @@ async def query_transcript(ctx: RunContext, query: str) -> str:
             logger.info("No results found for query")
             return "No results found for the query"
 
-        # Process and immediately delete chunks
         combined_result = ""
         chunk_ids = []
 
@@ -328,16 +337,12 @@ async def query_transcript(ctx: RunContext, query: str) -> str:
             combined_result += f"\n{doc}\n"
             chunk_ids.append(id)
 
-        # Delete the chunks we just processed
         if chunk_ids:
             try:
                 logger.info(f"Deleting {len(chunk_ids)} processed chunks")
                 processor.collection.delete(ids=chunk_ids)
-
-                # Verify deletion
                 remaining = processor.collection.get()
                 logger.info(f"Remaining chunks: {len(remaining['ids'])}")
-
             except Exception as e:
                 logger.error(f"Error deleting chunks: {str(e)}", exc_info=True)
                 return f"Error deleting chunks: {str(e)}"
@@ -358,10 +363,7 @@ async def delete_processed_chunks(ctx: RunContext) -> str:
 
         chunk_ids = list(ctx.processed_chunks)
         processor.collection.delete(ids=chunk_ids)
-
-        # Clear the processed chunks
         ctx.processed_chunks.clear()
-
         return f"Successfully deleted {len(chunk_ids)} chunks"
 
     except Exception as e:
@@ -410,19 +412,10 @@ async def add_decision(ctx: RunContext, title: str, content: str) -> str:
 
 @processor.agent.tool
 async def save_final_summary_result(ctx: RunContext) -> str:
-    """
-    Save the final meeting summary result to a file
-    args:
-        ctx (RunContext): The run context
-
-    returns:
-        str: Status message indicating success or failure
-    """
+    """Save the final meeting summary result to a file"""
     try:
-        # Get the final summary result
         summary = processor.summarizer.generate_summary(ctx)
 
-        # Validate summary has content
         if not any(
             [
                 summary.Agenda.blocks,
@@ -433,12 +426,9 @@ async def save_final_summary_result(ctx: RunContext) -> str:
         ):
             return "Error: No content found in summary. Please add some items first."
 
-        # Convert to JSON using Pydantic's json() method which handles nested models
         json_data = summary.model_dump_json(indent=2)
-
         self.final_summary_result = json_data
 
-        # Save to file with error handling
         try:
             with open("final_summary_result.json", "w") as f:
                 f.write(json_data)
@@ -470,7 +460,6 @@ async def process_transcript_background(process_id: str, transcript: TranscriptR
     try:
         logger.info(f"Starting background processing for process_id: {process_id}")
 
-        # Initialize components with proper dependencies
         deps = {
             "db": processor.db,
             "transcript_processor": processor.transcript_processor,
@@ -482,7 +471,6 @@ async def process_transcript_background(process_id: str, transcript: TranscriptR
         )
         ctx.process_id = process_id
 
-        # Process transcript
         num_chunks, all_json_data = (
             await processor.transcript_processor.process_transcript(
                 text=transcript.text,
@@ -493,7 +481,6 @@ async def process_transcript_background(process_id: str, transcript: TranscriptR
             )
         )
 
-        # Create final summary structure
         final_summary = {
             "MeetingName": "",
             "SectionSummary": {"title": "Section Summary", "blocks": []},
@@ -505,39 +492,37 @@ async def process_transcript_background(process_id: str, transcript: TranscriptR
             "ClosingRemarks": {"title": "Closing Remarks", "blocks": []},
         }
 
-        # Process each chunk's data
         for json_str in all_json_data:
             json_dict = json.loads(json_str)
-            final_summary["MeetingName"] = json_dict["MeetingName"]
+            if json_dict.get("MeetingName") and not final_summary["MeetingName"]:
+                final_summary["MeetingName"] = json_dict["MeetingName"]
             final_summary["SectionSummary"]["blocks"].extend(
-                json_dict["SectionSummary"]["blocks"]
+                json_dict.get("SectionSummary", {}).get("blocks", [])
             )
             final_summary["CriticalDeadlines"]["blocks"].extend(
-                json_dict["CriticalDeadlines"]["blocks"]
+                json_dict.get("CriticalDeadlines", {}).get("blocks", [])
             )
             final_summary["KeyItemsDecisions"]["blocks"].extend(
-                json_dict["KeyItemsDecisions"]["blocks"]
+                json_dict.get("KeyItemsDecisions", {}).get("blocks", [])
             )
             final_summary["ImmediateActionItems"]["blocks"].extend(
-                json_dict["ImmediateActionItems"]["blocks"]
+                json_dict.get("ImmediateActionItems", {}).get("blocks", [])
             )
             final_summary["NextSteps"]["blocks"].extend(
-                json_dict["NextSteps"]["blocks"]
+                json_dict.get("NextSteps", {}).get("blocks", [])
             )
             final_summary["OtherImportantPoints"]["blocks"].extend(
-                json_dict["OtherImportantPoints"]["blocks"]
+                json_dict.get("OtherImportantPoints", {}).get("blocks", [])
             )
             final_summary["ClosingRemarks"]["blocks"].extend(
-                json_dict["ClosingRemarks"]["blocks"]
+                json_dict.get("ClosingRemarks", {}).get("blocks", [])
             )
 
-        # Update database with meeting name
         if final_summary["MeetingName"]:
             await processor.db.update_meeting_name(
                 process_id, final_summary["MeetingName"]
             )
 
-        # Save final result
         await processor.db.update_process(
             process_id, status="completed", result=json.dumps(final_summary)
         )
@@ -555,10 +540,7 @@ async def process_transcript_api(
 ):
     """Process a transcript text with background processing"""
     try:
-        # Create new process
         process_id = await processor.db.create_process()
-
-        # Save transcript data
         await processor.db.save_transcript(
             process_id,
             transcript.text,
@@ -567,12 +549,8 @@ async def process_transcript_api(
             transcript.chunk_size,
             transcript.overlap,
         )
-
-        # Start background processing
         background_tasks.add_task(process_transcript_background, process_id, transcript)
-
         return JSONResponse({"message": "Processing started", "process_id": process_id})
-
     except Exception as e:
         logger.error(f"Error in process_transcript_api: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -597,25 +575,18 @@ async def get_summary(process_id: str):
                 },
             )
 
-        status = result[
-            "status"
-        ].lower()  # Convert to lowercase for case-insensitive comparison
-
-        # Parse result data if available
+        status = result["status"].lower()
         summary_data = None
         if result.get("result"):
             try:
-                # The result is already a JSON string, so we need to parse it
                 summary_data = json.loads(result["result"])
                 if isinstance(summary_data, str):
-                    # If it's still a string, it means it was double-encoded
                     summary_data = json.loads(summary_data)
             except json.JSONDecodeError as e:
                 logger.error(
                     f"Failed to parse JSON data for process {process_id}: {str(e)}"
                 )
 
-        # Build response
         response = {
             "status": "processing" if status in ["processing", "pending"] else status,
             "meetingName": summary_data.get("MeetingName") if summary_data else None,
@@ -629,17 +600,14 @@ async def get_summary(process_id: str):
             response["status"] = "error"
             response["error"] = result.get("error", "Unknown error")
             return JSONResponse(status_code=400, content=response)
-
         elif status in ["processing", "pending"]:
             return JSONResponse(status_code=202, content=response)
-
         elif status == "completed":
             if not summary_data:
                 response["status"] = "error"
                 response["error"] = "Invalid or missing summary data"
                 return JSONResponse(status_code=500, content=response)
             return JSONResponse(status_code=200, content=response)
-
         else:
             response["status"] = "error"
             response["error"] = f"Unknown status: {status}"
@@ -677,7 +645,6 @@ async def upload_transcript(
         transcript_text = content.decode()
         logger.info("Successfully decoded transcript file content")
 
-        # Create transcript request
         transcript = TranscriptRequest(
             text=transcript_text,
             model=model,
@@ -686,19 +653,12 @@ async def upload_transcript(
             overlap=overlap,
         )
 
-        # Create new process
         process_id = await processor.db.create_process()
-
-        # Save transcript data
         await processor.db.save_transcript(
             process_id, transcript_text, model, model_name, chunk_size, overlap
         )
-
-        # Start background processing
         background_tasks.add_task(process_transcript_background, process_id, transcript)
-
         return JSONResponse({"message": "Processing started", "process_id": process_id})
-
     except Exception as e:
         logger.error(f"Error processing transcript file: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -709,14 +669,10 @@ async def start_summarization(background_tasks: BackgroundTasks) -> Dict[str, st
     """Start the summarization process"""
     logger.info("Received request to start summarization")
     try:
-        # Create a new process in the database
         process_id = await processor.db.create_process()
         logger.info(f"Created process with ID: {process_id}")
-
-        # Start background processing
         background_tasks.add_task(process_and_update, process_id)
         logger.info(f"Added background task for process {process_id}")
-
         return {"process_id": process_id}
     except Exception as e:
         logger.error(f"Error in start_summarization: {str(e)}", exc_info=True)
@@ -727,11 +683,8 @@ async def process_and_update(process_id: str):
     """Process the summary and update the database"""
     logger.info(f"Starting background processing for {process_id}")
     try:
-        # Process the summary
         result = await processor.process_summary(process_id)
         logger.info(f"Generated summary for {process_id}")
-
-        # Update the database with the result
         await processor.db.update_process(process_id, "COMPLETED", result=result)
         logger.info(f"Updated process {process_id} as completed")
     except Exception as e:
@@ -741,20 +694,33 @@ async def process_and_update(process_id: str):
         await processor.db.update_process(process_id, "FAILED", error=str(e))
 
 
+# ==================== STARTUP & SHUTDOWN EVENTS ====================
+@app.on_event("startup")
+async def startup_event():
+    """Initialize services on startup"""
+    global whisperx_service
+    logger.info("🚀 Initializing services...")
+
+    try:
+        whisperx_service = WhisperXService()
+        logger.info("✅ WhisperX service ready")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize WhisperX: {e}")
+        whisperx_service = None
+
+
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on API shutdown"""
     logger.info("API shutting down, cleaning up resources")
     try:
-        await processor.cleanup()
+        processor.cleanup()
         logger.info("Successfully cleaned up resources")
     except Exception as e:
         logger.error(f"Error during cleanup: {str(e)}", exc_info=True)
 
 
 # ==================== TRANSLATION ENDPOINTS ====================
-
-
 @app.get("/languages")
 async def get_languages():
     """Trả về danh sách ngôn ngữ hỗ trợ"""
@@ -770,18 +736,123 @@ async def translate_text(request: dict):
     {
         "text": "text to translate",
         "target_lang": "en",
-        "source_lang": "auto" (optional)
+        "source_lang": "auto" (optional),
+        "sequence": 0 (optional)
     }
     """
     text = request.get("text", "")
     target_lang = request.get("target_lang", "en")
     source_lang = request.get("source_lang", "auto")
+    sequence = request.get("sequence", None)
 
-    result = await translation_service.translate(text, target_lang, source_lang)
+    result = await translation_service.translate(
+        text, target_lang, source_lang, seq=sequence
+    )
     return result
 
 
-# ==================== END TRANSLATION ENDPOINTS ====================
+# ==================== WHISPERX DIARIZATION ENDPOINTS ====================
+
+
+@app.post("/diarize")
+async def diarize_audio(file: UploadFile = File(...)):
+    """Nhận diện người nói từ file audio (dùng WhisperX) và tự động map tên"""
+    if not whisperx_service:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "WhisperX service not initialized. Please check logs."},
+        )
+
+    content = await file.read()
+    print(f"📦 Backend nhận được file dung lượng: {len(content)} bytes")
+
+    if len(content) < 100:
+        return JSONResponse(
+            status_code=400, content={"error": "File quá nhỏ hoặc trống"}
+        )
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    try:
+        raw_result = await whisperx_service.process_audio(tmp_path)
+        mapped_result = map_speakers_to_real_names(raw_result)
+        return JSONResponse(content=mapped_result)
+    except Exception as e:
+        logger.error(f"Error in diarization: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+# 🔥 API MỚI: Nhận đường dẫn file thay vì file blob
+@app.post("/diarize-local")
+async def diarize_local_audio(req: LocalDiarizeRequest):
+    """Nhận đường dẫn file từ Frontend và tự đọc từ ổ cứng"""
+    if not whisperx_service:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "WhisperX service not initialized. Please check logs."},
+        )
+
+    if not os.path.exists(req.file_path):
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"File không tồn tại trên ổ cứng: {req.file_path}"},
+        )
+
+    try:
+        logger.info(f"📦 Backend trực tiếp đọc file từ: {req.file_path}")
+
+        # 1. Gọi trực tiếp whisperx_service đọc file từ ổ cứng
+        raw_result = await whisperx_service.process_audio(req.file_path)
+
+        # 2. Map tên thật từ danh bạ
+        mapped_result = map_speakers_to_real_names(raw_result)
+
+        return JSONResponse(content=mapped_result)
+    except Exception as e:
+        logger.error(f"Error in local diarization: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+# ==================== SPEAKER MAPPING ENDPOINTS ====================
+@app.get("/speakers")
+async def get_speakers():
+    """Lấy danh sách tất cả những người tham gia đã được đặt tên"""
+    return JSONResponse(content={"speakers": get_all_speakers()})
+
+
+@app.post("/speakers/map")
+async def map_speaker(req: MappingRequest):
+    """Cập nhật tên và email cho một SPEAKER_XX"""
+    try:
+        meeting_directory.update_mapping(req.speaker_id, req.name, req.email)
+        return JSONResponse(
+            content={
+                "status": "success",
+                "message": f"Đã cập nhật {req.speaker_id} thành {req.name}",
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error mapping speaker: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/speakers/{speaker_id}")
+async def delete_speaker_mapping(speaker_id: str):
+    """Xóa một mapping"""
+    try:
+        meeting_directory.delete_mapping(speaker_id)
+        return JSONResponse(
+            content={"status": "success", "message": f"Đã xóa mapping cho {speaker_id}"}
+        )
+    except Exception as e:
+        logger.error(f"Error deleting mapping: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 if __name__ == "__main__":
     import multiprocessing

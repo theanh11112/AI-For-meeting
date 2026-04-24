@@ -1,0 +1,120 @@
+import os
+import torch
+import torchaudio
+import whisperx
+import gc
+from pyannote.audio import Pipeline
+from pyannote.core import Annotation, Segment
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+class WhisperXService:
+    def __init__(self):
+        self.device = "cpu"
+        self.compute_type = "float32"
+        self.hf_token = os.getenv("HUGGINGFACE_TOKEN")
+
+        print(f"🚀 Initializing WhisperX on {self.device}...")
+        self.model = whisperx.load_model(
+            "large-v3-turbo", self.device, compute_type=self.compute_type
+        )
+
+        self.align_model = None
+        self.align_metadata = None
+        self.diarize_pipeline = None
+
+        if self.hf_token:
+            try:
+                print("📥 Loading diarization pipeline (pyannote 3.1)...")
+                self.diarize_pipeline = Pipeline.from_pretrained(
+                    "pyannote/speaker-diarization-3.1", token=self.hf_token
+                )
+                print("✅ Diarization pipeline loaded successfully")
+            except Exception as e:
+                print(f"⚠️ Diarization load failed: {e}")
+        else:
+            print("⚠️ No HF token, diarization disabled")
+
+    async def process_audio(self, audio_path: str) -> dict:
+        if not os.path.exists(audio_path):
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+        # 1. LOAD AUDIO MONO (Fix AudioDecoder)
+        waveform, sample_rate = torchaudio.load(audio_path)
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+        if sample_rate != 16000:
+            resampler = torchaudio.transforms.Resample(sample_rate, 16000)
+            waveform = resampler(waveform)
+            sample_rate = 16000
+        audio_numpy = waveform.numpy().squeeze()
+
+        # 2. TRANSCRIPTION
+        result = self.model.transcribe(audio_numpy, batch_size=16)
+
+        # 3. ALIGNMENT
+        if self.align_model is None:
+            self.align_model, self.align_metadata = whisperx.load_align_model(
+                language_code=result["language"], device=self.device
+            )
+        result = whisperx.align(
+            result["segments"],
+            self.align_model,
+            self.align_metadata,
+            audio_numpy,
+            self.device,
+        )
+
+        # ==================== BƯỚC 4: DIARIZATION ====================
+        if self.diarize_pipeline:
+            print("👥 Running speaker diarization...")
+            try:
+                # Chạy pipeline
+                diarize_output = self.diarize_pipeline(
+                    {"waveform": waveform, "sample_rate": sample_rate}
+                )
+
+                # Chuyển đổi sang Annotation (nếu cần)
+                diarization = diarize_output
+                if hasattr(diarize_output, "as_annotation"):
+                    diarization = diarize_output.as_annotation()
+
+                # Gán người nói cho từng segment
+                for segment in result["segments"]:
+                    s = Segment(segment["start"], segment["end"])
+                    speakers_in_range = diarization.crop(s)
+                    labels = speakers_in_range.labels()
+
+                    if labels:
+                        # Tìm người nói chiếm thời gian nhiều nhất
+                        durations = {
+                            label: speakers_in_range.label_duration(label)
+                            for label in labels
+                        }
+                        segment["speaker"] = max(durations, key=durations.get)
+                    else:
+                        segment["speaker"] = "SPEAKER_00"
+
+                print("✅ Speakers assigned correctly")
+            except Exception as e:
+                print(f"⚠️ Diarization mapping failed: {e}")
+                for seg in result["segments"]:
+                    seg["speaker"] = "SPEAKER_00"
+        # ===================================================================
+
+        gc.collect()
+
+        # 5. FORMAT OUTPUT
+        final_segments = []
+        for seg in result["segments"]:
+            final_segments.append(
+                {
+                    "text": seg["text"].strip(),
+                    "start": round(seg["start"], 2),
+                    "end": round(seg["end"], 2),
+                    "speaker": seg.get("speaker", "SPEAKER_00"),
+                }
+            )
+        return {"segments": final_segments}
