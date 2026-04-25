@@ -181,7 +181,7 @@ cat > "$PACKAGE_NAME/run-server.sh" << 'EOL'
 
 # Default configuration
 HOST="127.0.0.1"
-PORT="8178"
+PORT="5167"
 MODEL="models/ggml-large-v3.bin"
 
 # Parse command line arguments

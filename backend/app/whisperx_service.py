@@ -1,3 +1,4 @@
+# backend/app/whisperx_service.py
 import os
 import torch
 import numpy as np
@@ -45,27 +46,22 @@ class WhisperXService:
         audio_numpy = None
         sample_rate = None
 
-        # ==================== 1. LOAD AUDIO BẰNG LIBROSA ====================
+        # ==================== 1. LOAD AUDIO ====================
         try:
-            # Dùng librosa.load - xử lý tốt file WAV lỗi header
             audio_numpy, sample_rate = librosa.load(audio_path, sr=16000, mono=True)
             print(f"✅ Librosa loaded. Duration: {len(audio_numpy)/sample_rate:.2f}s")
 
         except Exception as e:
             print(f"⚠️ Librosa fail: {e}")
 
-            # ==================== 2. FALLBACK: ĐỌC RAW (BYPASS HEADER) ====================
             try:
                 print("🔄 Fallback: Reading RAW audio data (bypassing header)...")
                 with open(audio_path, "rb") as f:
                     raw_data = f.read()
 
-                    # Kiểm tra file có đủ lớn không
                     if len(raw_data) < 44:
                         raise RuntimeError(f"File quá nhỏ: {len(raw_data)} bytes")
 
-                    # Bỏ qua 44 byte header (dù nó có lỗi hay không)
-                    # Rust ghi 16-bit PCM, sample rate 44100 Hz
                     audio_numpy = (
                         np.frombuffer(raw_data[44:], dtype=np.int16).astype(np.float32)
                         / 32768.0
@@ -76,7 +72,6 @@ class WhisperXService:
                         f"   Raw data size: {len(raw_data)} bytes, audio samples: {len(audio_numpy)}"
                     )
 
-                    # Resample về 16000Hz cho WhisperX
                     if sample_rate != 16000:
                         print(f"   🔄 Resampling from {sample_rate}Hz to 16000Hz")
                         audio_numpy = librosa.resample(
@@ -92,17 +87,15 @@ class WhisperXService:
                 print(f"❌ All loading methods failed: {e2}")
                 raise RuntimeError(f"Could not read audio file: {e2}")
 
-        # Chuyển thành tensor cho Pyannote
         waveform = torch.from_numpy(audio_numpy).unsqueeze(0)
 
         # ==================== 2. TRANSCRIPTION ====================
         print("📝 Transcribing with WhisperX...")
         try:
-            # 🔥 SỬA QUAN TRỌNG: Chỉ định language='en' để tránh tải model tiếng Trung
             result = self.model.transcribe(
                 audio_numpy,
                 batch_size=16,
-                language="en",  # 👈 ÉP TIẾNG ANH - TRÁNH TẢI MODEL 1.28GB
+                language="en",
             )
             print(f"✅ Transcription complete: {len(result['segments'])} segments")
         except Exception as e:
@@ -113,7 +106,6 @@ class WhisperXService:
         print("🔄 Running alignment...")
         try:
             if self.align_model is None:
-                # 🔥 Dùng language từ kết quả transcription (sẽ là 'en')
                 self.align_model, self.align_metadata = whisperx.load_align_model(
                     language_code=result["language"], device=self.device
                 )
@@ -211,9 +203,26 @@ class WhisperXService:
             for seg in result["segments"]:
                 seg["speaker"] = "UNKNOWN"
 
+        # ==================== 5. GIẢI PHÓNG RAM NHẸ (KHÔNG XÓA MODEL) ====================
+        # 🔥 QUAN TRỌNG: Không del self.model, self.align_model, self.diarize_pipeline ở đây
+        # Vì main.py đang cache service này để tái sử dụng
+        # Chỉ dọn dẹp các reference tạm thời và clear cache
+
+        # Chỉ clear các biến tạm trong function
+        del waveform
+        del audio_numpy
+
+        # Gọi dọn rác
         gc.collect()
 
-        # ==================== 5. FORMAT OUTPUT ====================
+        # Clear cache Metal (Mac M2)
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+            print("✅ Cleared Metal cache (MPS)")
+
+        print("♻️ WhisperX processing complete (model kept in cache for next use)")
+
+        # ==================== 6. FORMAT OUTPUT ====================
         final_segments = []
         for seg in result["segments"]:
             final_segments.append(

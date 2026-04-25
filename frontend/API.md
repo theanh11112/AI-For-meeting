@@ -14,17 +14,17 @@ The Whisper.cpp Live Transcription API provides real-time speech-to-text transcr
 
 ### Command Line Options
 
-| Option | Description | Default |
-|--------|-------------|---------|
-| `-m, --model` | Path to the Whisper model file | Required |
-| `-h, --host` | Host to bind the server | "127.0.0.1" |
-| `-p, --port` | Port to bind the server | 8178 |
-| `-t, --threads` | Number of threads to use | 4 |
-| `-c, --context` | Maximum context size | 16384 |
-| `-l, --language` | Language to use for transcription | "auto" |
-| `-tr, --translate` | Translate to English | false |
-| `-ps, --print-special` | Print special tokens | false |
-| `-pc, --print-colors` | Print colors | false |
+| Option                 | Description                       | Default     |
+| ---------------------- | --------------------------------- | ----------- |
+| `-m, --model`          | Path to the Whisper model file    | Required    |
+| `-h, --host`           | Host to bind the server           | "127.0.0.1" |
+| `-p, --port`           | Port to bind the server           | 5167        |
+| `-t, --threads`        | Number of threads to use          | 4           |
+| `-c, --context`        | Maximum context size              | 16384       |
+| `-l, --language`       | Language to use for transcription | "auto"      |
+| `-tr, --translate`     | Translate to English              | false       |
+| `-ps, --print-special` | Print special tokens              | false       |
+| `-pc, --print-colors`  | Print colors                      | false       |
 
 ## API Endpoints
 
@@ -38,9 +38,9 @@ Streams audio data for real-time transcription.
 
 #### Request Parameters
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `audio` | Binary | Raw audio data in 32-bit float PCM format |
+| Parameter | Type   | Description                               |
+| --------- | ------ | ----------------------------------------- |
+| `audio`   | Binary | Raw audio data in 32-bit float PCM format |
 
 #### Audio Requirements
 
@@ -53,14 +53,14 @@ Streams audio data for real-time transcription.
 
 ```json
 {
-    "segments": [
-        {
-            "text": "Transcribed text segment",
-            "t0": 0.0,    // Start time in seconds
-            "t1": 1.0     // End time in seconds
-        }
-    ],
-    "buffer_size_ms": 1200  // Current buffer size in milliseconds
+  "segments": [
+    {
+      "text": "Transcribed text segment",
+      "t0": 0.0, // Start time in seconds
+      "t1": 1.0 // End time in seconds
+    }
+  ],
+  "buffer_size_ms": 1200 // Current buffer size in milliseconds
 }
 ```
 
@@ -68,13 +68,14 @@ Streams audio data for real-time transcription.
 
 ```json
 {
-    "error": "Error message description"
+  "error": "Error message description"
 }
 ```
 
 ### Example Usage
 
 #### JavaScript Example
+
 ```javascript
 // Initialize audio capture
 const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -84,27 +85,31 @@ const processor = audioContext.createScriptProcessor(4096, 1, 1);
 
 // Send audio chunks
 async function sendAudioChunk(audioData) {
-    const formData = new FormData();
-    formData.append('audio', new Blob([audioData], { 
-        type: 'application/octet-stream' 
-    }));
+  const formData = new FormData();
+  formData.append(
+    "audio",
+    new Blob([audioData], {
+      type: "application/octet-stream",
+    }),
+  );
 
-    const response = await fetch('/stream', {
-        method: 'POST',
-        body: formData
+  const response = await fetch("/stream", {
+    method: "POST",
+    body: formData,
+  });
+
+  const result = await response.json();
+  // Handle transcription results
+  if (result.segments) {
+    result.segments.forEach((segment) => {
+      console.log(`[${segment.t0}s - ${segment.t1}s]: ${segment.text}`);
     });
-
-    const result = await response.json();
-    // Handle transcription results
-    if (result.segments) {
-        result.segments.forEach(segment => {
-            console.log(`[${segment.t0}s - ${segment.t1}s]: ${segment.text}`);
-        });
-    }
+  }
 }
 ```
 
 #### Rust Example
+
 ```rust
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use reqwest::multipart;
@@ -185,7 +190,7 @@ impl AudioStreamer {
 
                 // Send request
                 let response = self.client
-                    .post("http://localhost:8178/stream")
+                    .post("http://localhost:5167/stream")
                     .multipart(form)
                     .send()
                     .await?;
@@ -193,7 +198,7 @@ impl AudioStreamer {
                 // Handle response
                 if let Ok(result) = response.json::<TranscriptionResponse>().await {
                     for segment in result.segments {
-                        println!("[{:.2}s - {:.2}s]: {}", 
+                        println!("[{:.2}s - {:.2}s]: {}",
                             segment.t0, segment.t1, segment.text);
                     }
                 }
@@ -210,10 +215,10 @@ impl AudioStreamer {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let streamer = AudioStreamer::new();
-    
+
     // Start recording
     streamer.start_recording().await?;
-    
+
     // Process audio in parallel
     let process_handle = tokio::spawn(async move {
         streamer.process_audio().await
@@ -230,6 +235,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 #### Dependencies (Cargo.toml)
+
 ```toml
 [dependencies]
 cpal = "0.15"

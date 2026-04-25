@@ -1,28 +1,11 @@
-# filepath: backend/app/services/speaker_mapper.py
+# backend/app/services/speaker_mapper.py
 from app.models.user_map import meeting_directory
 from typing import Dict, List, Optional
+from datetime import datetime
 
 
 def map_speakers_to_real_names(transcript_data: dict) -> dict:
-    """
-    Thay thế 'SPEAKER_00' thành tên thật trong toàn bộ văn bản
-
-    Args:
-        transcript_data: Dict từ WhisperX với format:
-            {
-                "segments": [
-                    {"start": 1.0, "end": 5.0, "speaker": "SPEAKER_00", "text": "..."},
-                    ...
-                ]
-            }
-
-    Returns:
-        Dict với format:
-            {
-                "segments": [...],  # Giữ nguyên + thêm speaker_name
-                "full_text": "[Nguyễn Văn A] 1.0s - 5.0s: Hôm nay chúng ta bàn về..."
-            }
-    """
+    """Thay thế 'SPEAKER_00' thành tên thật trong toàn bộ văn bản"""
     mapped_segments = []
     full_text_with_names = []
 
@@ -31,16 +14,13 @@ def map_speakers_to_real_names(transcript_data: dict) -> dict:
         start_time = seg.get("start", 0)
         end_time = seg.get("end", 0)
 
-        # Tìm thông tin người nói trong danh bạ
         participant = meeting_directory.get_participant(speaker_id)
 
         if participant:
             real_name = participant.name
         else:
-            # Nếu chưa có trong danh bạ, giữ nguyên speaker_id
             real_name = speaker_id
 
-        # Lưu segment đã mapping (dùng cho các mục đích khác)
         mapped_segments.append(
             {
                 "start": start_time,
@@ -51,8 +31,6 @@ def map_speakers_to_real_names(transcript_data: dict) -> dict:
             }
         )
 
-        # 🔥 QUAN TRỌNG: Thêm timestamp để AI Agent hiểu ngữ cảnh thời gian
-        # Format: [Tên người nói] start_time - end_time: Nội dung
         full_text_with_names.append(
             f"[{real_name}] {start_time:.1f}s - {end_time:.1f}s: {seg['text']}"
         )
@@ -81,15 +59,7 @@ def get_all_speakers() -> List[dict]:
 
 
 def get_speaker_email_by_name(name: str) -> Optional[str]:
-    """
-    Tìm email của người tham gia dựa vào tên
-
-    Args:
-        name: Tên người cần tìm (VD: "Nguyễn Văn A")
-
-    Returns:
-        Email nếu tìm thấy, None nếu không
-    """
+    """Tìm email của người tham gia dựa vào tên"""
     for participant in meeting_directory.get_all_participants():
         if participant.name.lower() == name.lower():
             return participant.email
@@ -97,15 +67,7 @@ def get_speaker_email_by_name(name: str) -> Optional[str]:
 
 
 def get_speaker_name_by_id(speaker_id: str) -> str:
-    """
-    Lấy tên thật từ speaker_id
-
-    Args:
-        speaker_id: Mã speaker (VD: "SPEAKER_00")
-
-    Returns:
-        Tên thật nếu có mapping, ngược lại trả về speaker_id
-    """
+    """Lấy tên thật từ speaker_id"""
     participant = meeting_directory.get_participant(speaker_id)
     return participant.name if participant else speaker_id
 
@@ -113,98 +75,187 @@ def get_speaker_name_by_id(speaker_id: str) -> str:
 def format_transcript_for_ai(
     transcript_data: dict, include_timestamps: bool = True
 ) -> str:
-    """
-    Format transcript để gửi cho AI Agent
-
-    Args:
-        transcript_data: Output từ map_speakers_to_real_names
-        include_timestamps: Có bao gồm mốc thời gian không
-
-    Returns:
-        String đã format sẵn sàng cho AI Agent
-    """
+    """Format transcript để gửi cho AI Agent"""
     if include_timestamps:
         return transcript_data.get("full_text", "")
 
-    # Format không có timestamp (chỉ có tên)
     lines = []
     for seg in transcript_data.get("segments", []):
         lines.append(f"[{seg['speaker_name']}]: {seg['text']}")
-
     return "\n".join(lines)
+
+
+def get_participant_context() -> str:
+    """
+    🔥 HÀM MỚI: Lấy context đầy đủ về người tham gia cho LLM
+
+    Returns:
+        Chuỗi chứa danh sách người tham gia với email
+    """
+    speakers = get_all_speakers()
+    current_date = datetime.now().strftime("%d/%m/%Y")
+
+    context = f"Ngày họp: {current_date}\n"
+    context += "Danh sách người tham gia:\n"
+
+    for s in speakers:
+        email_display = s.get("email", "❌ Chưa có email")
+        context += f"- {s['name']} (Email: {email_display})\n"
+
+    missing_emails = [s["name"] for s in speakers if not s.get("email")]
+    if missing_emails:
+        context += (
+            f"\n⚠️ LƯU Ý: Những người sau chưa có email: {', '.join(missing_emails)}"
+        )
+
+    return context
 
 
 def generate_ai_prompt(transcript_text: str, custom_instructions: str = "") -> str:
     """
-    Tạo prompt chuẩn cho AI Agent để trích xuất Action Items và gửi email
+    🔥 HÀM TẠO PROMPT CHUẨN - ĐỒNG BỘ VỚI EnhancedSummaryResponse
 
     Args:
-        transcript_text: Transcript đã được mapping tên (full_text từ map_speakers_to_real_names)
+        transcript_text: Transcript đã được mapping tên
         custom_instructions: Hướng dẫn bổ sung cho AI Agent
 
     Returns:
         Prompt hoàn chỉnh để gửi cho AI Agent
     """
-    speakers = get_all_speakers()
+    speaker_context = get_participant_context()
+    current_date = datetime.now().strftime("%Y-%m-%d")
 
-    # Tạo danh sách speaker với email
-    speaker_list = "\n".join(
-        [
-            f"- {s['name']} (Email: {s.get('email', '❌ Chưa có email')})"
-            for s in speakers
-        ]
-    )
+    prompt = f"""Bạn là trợ lý AI thư ký cuộc họp chuyên nghiệp.
 
-    # Tạo danh sách speaker không có email để yêu cầu bổ sung
-    missing_emails = [s["name"] for s in speakers if not s.get("email")]
-    missing_email_note = ""
-    if missing_emails:
-        missing_email_note = f"\n\n⚠️ LƯU Ý: Những người sau chưa có email: {', '.join(missing_emails)}. Hãy yêu cầu bổ sung email trước khi gửi task cho họ."
-
-    prompt = f"""Bạn là trợ lý AI thư ký cuộc họp chuyên nghiệp. Nhiệm vụ của bạn:
-
-1. Đọc kỹ nội dung cuộc họp dưới đây
-2. Xác định tất cả các công việc cần làm (Action Items)
-3. Xác định chính xác người được giao việc dựa trên tên trong danh sách
-4. Trích xuất deadline (nếu có)
-5. Trả về kết quả dưới dạng JSON chuẩn
-
-📋 DANH SÁCH NGƯỜI THAM GIA (KÈM EMAIL):
-{speaker_list}
-{missing_email_note}
+📌 THÔNG TIN CUỘC HỌP:
+{speaker_context}
 
 📝 NỘI DUNG CUỘC HỌP (ĐÃ CÓ TIMESTAMP VÀ TÊN NGƯỜI NÓI):
 {transcript_text}
 
 {custom_instructions}
 
+🎯 NHIỆM VỤ CỦA BẠN:
+1. Đọc kỹ nội dung cuộc họp
+2. Xác định tất cả các QUYẾT ĐỊNH quan trọng
+3. Xác định tất cả các CÔNG VIỆC cần làm (Action Items)
+   - Mỗi công việc cần có: task, người được giao, deadline, priority
+   - SUY LUẬN NGỮ CẢNH: Tại sao việc này phát sinh?
+   - GỢI Ý CÁC BƯỚC THỰC HIỆN cụ thể (3 bước)
+4. Xác định các CÂU HỎI cần theo dõi sau cuộc họp
+
 📤 YÊU CẦU ĐẦU RA (CHỈ TRẢ VỀ JSON, KHÔNG CÓ NỘI DUNG KHÁC):
 {{
-    "meeting_summary": "Tóm tắt ngắn gọn cuộc họp trong 2-3 câu",
+    "meeting_name": "Tên cuộc họp",
+    "meeting_date": "{current_date}",
+    "general_summary": "Tóm tắt ngắn gọn cuộc họp trong 2-3 câu",
     "action_items": [
         {{
             "task": "Mô tả chi tiết công việc cần làm",
             "assignee_name": "Tên người được giao (phải khớp với danh sách trên)",
             "assignee_email": "Email của người được giao (lấy từ danh sách)",
-            "deadline": "Hạn hoàn thành (nếu có, format YYYY-MM-DD hoặc 'Không có')",
+            "context": "Trích dẫn từ cuộc họp: tại sao việc này cần làm",
+            "instructions": "Bước 1: ...\\nBước 2: ...\\nBước 3: ...",
+            "deadline": "YYYY-MM-DD hoặc 'Không có'",
             "priority": "Cao/Trung bình/Thấp"
         }}
     ],
-    "decisions": [
+    "key_decisions": [
         {{
             "decision": "Quyết định đã được đưa ra",
-            "made_by": "Ai đưa ra quyết định này"
+            "made_by": "Ai đưa ra quyết định này",
+            "context": "Bối cảnh dẫn đến quyết định này"
         }}
     ],
     "pending_questions": [
         {{
             "question": "Câu hỏi cần được trả lời sau",
             "asked_by": "Ai đã hỏi",
-            "assigned_to": "Ai cần trả lời (nếu có)"
+            "assigned_to": "Ai cần trả lời (nếu có)",
+            "urgency": "Cao/Trung bình/Thấp"
         }}
-    ]
+    ],
+    "key_topics_discussed": ["Chủ đề 1", "Chủ đề 2"]
 }}
 
-Hãy phân tích cẩn thận và trả về JSON chính xác!"""
+⚠️ LƯU Ý QUAN TRỌNG:
+- action_items.instructions: Phải có 3 bước cụ thể, bắt đầu bằng số 1., 2., 3.
+- action_items.priority: Chỉ dùng "Cao", "Trung bình", "Thấp"
+- action_items.assignee_name: Phải khớp chính xác với tên trong danh sách người tham gia
+- key_decisions: Sử dụng key "key_decisions" (không phải "decisions")
+- Nếu không có thông tin cho trường nào, để mảng rỗng []
+
+Hãy phân tích cẩn thận và trả về JSON chính xác theo format trên!"""
 
     return prompt
+
+
+# ==================== HÀM MERGE ACTION ITEMS ====================
+def merge_action_items(items_list: List[List[dict]]) -> List[dict]:
+    """
+    Merge action items từ nhiều chunks lại với nhau
+
+    Args:
+        items_list: List các list action items từ mỗi chunk
+
+    Returns:
+        List merged action items (đã deduplicate)
+    """
+    merged = {}
+
+    for items in items_list:
+        for item in items:
+            task_key = item.get("task", "").lower().strip()
+
+            if task_key not in merged:
+                merged[task_key] = item
+            else:
+                # Merge hoặc lấy phiên bản có nhiều thông tin hơn
+                existing = merged[task_key]
+                if not existing.get("context") and item.get("context"):
+                    existing["context"] = item["context"]
+                if not existing.get("instructions") and item.get("instructions"):
+                    existing["instructions"] = item["instructions"]
+                if not existing.get("deadline") and item.get("deadline"):
+                    existing["deadline"] = item["deadline"]
+                if not existing.get("priority") and item.get("priority"):
+                    existing["priority"] = item["priority"]
+
+    return list(merged.values())
+
+
+def merge_decisions(decisions_list: List[List[dict]]) -> List[dict]:
+    """Merge decisions từ nhiều chunks"""
+    merged = {}
+
+    for decisions in decisions_list:
+        for decision in decisions:
+            key = decision.get("decision", "").lower().strip()[:100]
+            if key not in merged:
+                merged[key] = decision
+
+    return list(merged.values())
+
+
+def merge_questions(questions_list: List[List[dict]]) -> List[dict]:
+    """Merge pending questions từ nhiều chunks"""
+    merged = {}
+
+    for questions in questions_list:
+        for question in questions:
+            key = question.get("question", "").lower().strip()[:100]
+            if key not in merged:
+                merged[key] = question
+
+    return list(merged.values())
+
+
+def merge_topics(topics_list: List[List[str]]) -> List[str]:
+    """Merge topics từ nhiều chunks"""
+    merged = set()
+
+    for topics in topics_list:
+        for topic in topics:
+            merged.add(topic)
+
+    return list(merged)

@@ -14,7 +14,7 @@ NC='\033[0m' # No Color
 # Configuration
 PACKAGE_NAME="whisper-server-package"
 MODEL_DIR="$PACKAGE_NAME/models"
-WHISPER_PORT=8178
+WHISPER_PORT=5167
 BACKEND_PORT=5167
 
 # Helper functions for logging

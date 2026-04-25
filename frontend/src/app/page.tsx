@@ -4,7 +4,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { 
   TranscriptWithSpeaker, 
-  Summary, 
+  EnhancedSummary,
   ModelConfig, 
   SummaryStatus,
   TranslatedSegment,
@@ -54,16 +54,13 @@ export default function Home() {
   const [barHeights, setBarHeights] = useState(['58%', '76%', '58%']);
   const [meetingTitle, setMeetingTitle] = useState('New Call');
   const [isEditingTitle, setIsEditingTitle] = useState(false);
-  const [aiSummary, setAiSummary] = useState<Summary | null>({
-    key_points: { title: "Key Points", blocks: [] },
-    action_items: { title: "Action Items", blocks: [] },
-    decisions: { title: "Decisions", blocks: [] },
-    main_topics: { title: "Main Topics", blocks: [] }
-  });
+  
+  const [aiSummary, setAiSummary] = useState<EnhancedSummary | null>(null);
   const [summaryError, setSummaryError] = useState<string | null>(null);
+  
   const [modelConfig, setModelConfig] = useState<ModelConfig>({
-    provider: 'ollama',
-    model: 'llama3.2:latest',
+    provider: 'groq',
+    model: 'llama-3.3-70b-versatile',
     whisperModel: 'large-v3'
   });
   const [originalTranscript, setOriginalTranscript] = useState<string>('');
@@ -328,6 +325,8 @@ export default function Home() {
       setTranscripts([]);
       setTranslatedSegments([]);
       setLastAudioFile(null);
+      setAiSummary(null);
+      setShowSummary(false);
       transcriptBufferRef.current = [];
       if (bufferTimerRef.current) {
         clearTimeout(bufferTimerRef.current);
@@ -382,8 +381,15 @@ export default function Home() {
 
   // AI Summary
   const generateAISummary = useCallback(async () => {
+    if (!transcripts.length) {
+      console.warn("No transcripts to summarize");
+      return;
+    }
+    
     setSummaryStatus('processing');
     setSummaryError(null);
+    setAiSummary(null);
+    
     try {
       const fullTranscript = [...transcripts]
         .sort((a, b) => a.t0 - b.t0)
@@ -393,7 +399,10 @@ export default function Home() {
         })
         .join('\n');
       
-      if (!fullTranscript.trim()) throw new Error('No transcript text available.');
+      if (!fullTranscript.trim()) {
+        throw new Error('No transcript text available.');
+      }
+      
       setOriginalTranscript(fullTranscript);
       
       const response = await fetch('http://localhost:5167/process-transcript', {
@@ -407,52 +416,95 @@ export default function Home() {
           overlap: 1000
         })
       });
-      if (!response.ok) throw new Error('Failed to process transcript');
+      
+      if (!response.ok) {
+        throw new Error('Failed to process transcript');
+      }
+      
       const { process_id } = await response.json();
+      console.log(`📋 Process ID: ${process_id}, polling for results...`);
       
       const pollInterval = setInterval(async () => {
         try {
           const statusResponse = await fetch(`http://localhost:5167/get-summary/${process_id}`);
-          if (!statusResponse.ok) throw new Error('Failed to get summary');
+          if (!statusResponse.ok) {
+            throw new Error('Failed to get summary status');
+          }
+          
           const result = await statusResponse.json();
+          
           if (result.status === 'error') {
-            setSummaryError(result.error);
+            clearInterval(pollInterval);
+            setSummaryError(result.error || 'Unknown error');
             setSummaryStatus('error');
+          } else if (result.status === 'completed') {
             clearInterval(pollInterval);
-          } else if (result.status === 'completed' && result.data) {
-            clearInterval(pollInterval);
-            const { MeetingName, ...summaryData } = result.data;
-            if (MeetingName) setMeetingTitle(MeetingName);
-            const formattedSummary = Object.entries(summaryData).reduce((acc: Summary, [key, section]: [string, any]) => {
-              acc[key] = {
-                title: section.title,
-                blocks: section.blocks.map((block: any) => ({
-                  ...block,
-                  type: 'bullet',
-                  color: 'default',
-                  content: block.content.trim()
-                }))
-              };
-              return acc;
-            }, {} as Summary);
-            setAiSummary(formattedSummary);
-            setSummaryStatus('completed');
+            
+            try {
+              const enhancedRes = await fetch(`http://localhost:5167/get-action-items/${process_id}`);
+              if (enhancedRes.ok) {
+                const enhancedData = await enhancedRes.json();
+                console.log('✅ Enhanced summary data received:', enhancedData);
+                
+                if (enhancedData.meeting_name) {
+                  setMeetingTitle(enhancedData.meeting_name);
+                }
+                
+                setAiSummary(enhancedData);
+                setSummaryStatus('completed');
+              } else {
+                const { MeetingName } = result.data;
+                if (MeetingName) setMeetingTitle(MeetingName);
+                setAiSummary({
+                  meeting_name: MeetingName || 'Cuộc họp',
+                  meeting_date: new Date().toISOString().split('T')[0],
+                  general_summary: '',
+                  key_decisions: [],
+                  action_items: [],
+                  pending_questions: [],
+                  key_topics_discussed: []
+                });
+                setSummaryStatus('completed');
+              }
+            } catch (enhancedErr) {
+              console.error('Error fetching enhanced summary:', enhancedErr);
+              const { MeetingName } = result.data;
+              if (MeetingName) setMeetingTitle(MeetingName);
+              setAiSummary({
+                meeting_name: MeetingName || 'Cuộc họp',
+                meeting_date: new Date().toISOString().split('T')[0],
+                general_summary: '',
+                key_decisions: [],
+                action_items: [],
+                pending_questions: [],
+                key_topics_discussed: []
+              });
+              setSummaryStatus('completed');
+            }
           }
         } catch (err) {
-          clearInterval(pollInterval);
-          setSummaryStatus('error');
+          console.error('Polling error:', err);
         }
-      }, 5000);
+      }, 3000);
+      
       return () => clearInterval(pollInterval);
+      
     } catch (err) {
+      console.error('Error generating summary:', err);
+      setSummaryError(err instanceof Error ? err.message : 'Failed to generate summary');
       setSummaryStatus('error');
     }
   }, [transcripts, modelConfig, getSpeakerDisplayName]);
 
   const handleRegenerateSummary = useCallback(async () => {
-    if (!originalTranscript.trim()) return;
+    if (!originalTranscript.trim()) {
+      console.warn("No original transcript to regenerate");
+      return;
+    }
     setSummaryStatus('regenerating');
     setSummaryError(null);
+    setAiSummary(null);
+    
     try {
       const response = await fetch('http://localhost:5167/process-transcript', {
         method: 'POST',
@@ -480,28 +532,48 @@ export default function Home() {
             clearInterval(pollInterval);
           } else if (result.status === 'completed' && result.data) {
             clearInterval(pollInterval);
-            const { MeetingName, ...summaryData } = result.data;
-            if (MeetingName) setMeetingTitle(MeetingName);
-            const formattedSummary = Object.entries(summaryData).reduce((acc: Summary, [key, section]: [string, any]) => {
-              acc[key] = {
-                title: section.title,
-                blocks: section.blocks.map((block: any) => ({
-                  ...block,
-                  type: 'bullet',
-                  color: 'default',
-                  content: block.content.trim()
-                }))
-              };
-              return acc;
-            }, {} as Summary);
-            setAiSummary(formattedSummary);
-            setSummaryStatus('completed');
+            
+            try {
+              const enhancedRes = await fetch(`http://localhost:5167/get-action-items/${process_id}`);
+              if (enhancedRes.ok) {
+                const enhancedData = await enhancedRes.json();
+                if (enhancedData.meeting_name) setMeetingTitle(enhancedData.meeting_name);
+                setAiSummary(enhancedData);
+                setSummaryStatus('completed');
+              } else {
+                const { MeetingName } = result.data;
+                if (MeetingName) setMeetingTitle(MeetingName);
+                setAiSummary({
+                  meeting_name: MeetingName || 'Cuộc họp',
+                  meeting_date: new Date().toISOString().split('T')[0],
+                  general_summary: '',
+                  key_decisions: [],
+                  action_items: [],
+                  pending_questions: [],
+                  key_topics_discussed: []
+                });
+                setSummaryStatus('completed');
+              }
+            } catch {
+              const { MeetingName } = result.data;
+              if (MeetingName) setMeetingTitle(MeetingName);
+              setAiSummary({
+                meeting_name: MeetingName || 'Cuộc họp',
+                meeting_date: new Date().toISOString().split('T')[0],
+                general_summary: '',
+                key_decisions: [],
+                action_items: [],
+                pending_questions: [],
+                key_topics_discussed: []
+              });
+              setSummaryStatus('completed');
+            }
           }
         } catch (err) {
           clearInterval(pollInterval);
           setSummaryStatus('error');
         }
-      }, 10000);
+      }, 5000);
       return () => clearInterval(pollInterval);
     } catch (err) {
       setSummaryStatus('error');
@@ -661,13 +733,11 @@ export default function Home() {
 
   const isSummaryLoading = summaryStatus === 'processing' || summaryStatus === 'summarizing' || summaryStatus === 'regenerating';
 
-  // Render
   return (
     <div className="flex flex-col h-screen bg-gray-50">
       <div className="flex flex-1 overflow-hidden">
         {/* Left side - Transcript */}
         <div className="w-1/3 min-w-[300px] border-r border-gray-200 bg-white flex flex-col relative">
-          {/* Header area */}
           <div className="p-4 border-b border-gray-200">
             <div className="flex flex-col space-y-3">
               <div className="flex items-center">
@@ -765,13 +835,14 @@ export default function Home() {
           {isSummaryLoading ? (
             <div className="flex items-center justify-center h-full">
               <div className="text-center">
-                <div className="inline-block animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-blue-500 mb-4"></div>
-                <p className="text-gray-600">Đang tạo tóm tắt AI...</p>
+                <div className="inline-block animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-indigo-500 mb-4"></div>
+                <p className="text-gray-600">AI đang phân tích nội dung cuộc họp...</p>
+                <p className="text-gray-400 text-xs mt-1">Quá trình này có thể mất vài giây</p>
               </div>
             </div>
           ) : showSummary && (
             <div className="max-w-4xl mx-auto p-6">
-              <div className="flex-1 overflow-y-auto p-4">
+              <div className="flex-1 overflow-y-auto">
                 <AISummary 
                   summary={aiSummary} 
                   status={summaryStatus} 
@@ -780,6 +851,7 @@ export default function Home() {
                   onRegenerateSummary={handleRegenerateSummary}
                 />
               </div>
+              {/* 🔥 ĐÃ SỬA: Bỏ điều kiện `!== 'processing'` vì đã ở trong `!isSummaryLoading` */}
               {summaryStatus !== 'idle' && (
                 <div className={`mt-4 p-4 rounded-lg ${
                   summaryStatus === 'error' ? 'bg-red-100 text-red-700' :

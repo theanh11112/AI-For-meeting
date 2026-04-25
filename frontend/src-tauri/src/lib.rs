@@ -248,7 +248,7 @@ async fn send_audio_chunk(chunk: Vec<f32>, client: &reqwest::Client) -> Result<T
             .mime_str("audio/x-raw")
             .unwrap();
         let form = Form::new().part("audio", part);
-        match client.post("http://127.0.0.1:8178/stream")
+        match client.post("http://127.0.0.1:5167/stream")
             .multipart(form)
             .send()
             .await {
