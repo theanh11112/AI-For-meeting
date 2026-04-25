@@ -1,3 +1,4 @@
+// frontend/src/types/index.ts
 export interface Message {
   id: string;
   content: string;
@@ -41,4 +42,71 @@ export interface SummaryResponse {
     completion_tokens: number;
     total_tokens: number;
   };
+}
+
+// ============ THÊM CÁC INTERFACE MỚI (BẮT BUỘC) ============
+
+export interface TranscriptWithSpeaker extends Transcript {
+  t0: number;
+  t1: number;
+  speaker?: string;
+  seq?: number;
+  isVerified?: boolean;
+}
+
+export interface TranslatedSegment {
+  timestamp: string;
+  original: string;
+  translated: string;
+  t0: number;
+  t1: number;
+  speaker?: string;
+}
+
+export interface SpeakerMap {
+  speaker_id: string;
+  name: string;
+  email: string;
+}
+
+export interface ModelConfig {
+  provider: 'ollama' | 'groq' | 'claude';
+  model: string;
+  whisperModel: string;
+}
+
+export type SummaryStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
+
+export interface TranscriptUpdate {
+  text: string;
+  timestamp: string;
+  source: string;
+  t0?: number;
+  t1?: number;
+  seq?: number;
+}
+
+export interface OllamaModel {
+  name: string;
+  id: string;
+  size: string;
+  modified: string;
+}
+
+export interface SummaryBlock {
+  title: string;
+  content: string;
+  type?: 'bullet' | 'number' | 'text';
+  color?: string;
+}
+
+export interface SummarySection {
+  title: string;
+  blocks: SummaryBlock[];
+}
+
+export interface AsyncSummaryResponse {
+  status: 'processing' | 'completed' | 'error';
+  data?: Summary;
+  error?: string;
 }
