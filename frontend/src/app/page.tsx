@@ -1,4 +1,3 @@
-// app/page.tsx
 'use client';
 
 import { useState, useEffect, useCallback, useRef } from 'react';
@@ -44,10 +43,11 @@ export default function Home() {
   const [isRecording, setIsRecording] = useState(false);
   const [transcripts, setTranscripts] = useState<TranscriptWithSpeaker[]>([]);
   
+  // Tối ưu: Giảm thời gian flush xuống 500ms để hiển thị nhanh hơn
   const transcriptBufferRef = useRef<TranscriptWithSpeaker[]>([]);
   const bufferTimerRef = useRef<number | null>(null);
   const transcriptsRef = useRef<TranscriptWithSpeaker[]>([]);
-  const FLUSH_TIMEOUT_MS = 1000;
+  const FLUSH_TIMEOUT_MS = 500;
   
   const [showSummary, setShowSummary] = useState(false);
   const [summaryStatus, setSummaryStatus] = useState<SummaryStatus>('idle');
@@ -178,7 +178,7 @@ export default function Home() {
     }
   };
 
-  // Translation
+  // Translation with retry logic
   const translateWithRetry = useCallback(async (
     text: string, 
     timestamp: string, 
@@ -201,8 +201,11 @@ export default function Home() {
         })
       });
       
+      // Xử lý rate limit với exponential backoff
       if (response.status === 429 && retryCount < 3) {
-        await new Promise(resolve => setTimeout(resolve, 2000 * (retryCount + 1)));
+        const delay = 2000 * Math.pow(2, retryCount);
+        console.log(`⚠️ Rate limit hit, waiting ${delay}ms (attempt ${retryCount + 1}/3)`);
+        await new Promise(resolve => setTimeout(resolve, delay));
         return translateWithRetry(text, timestamp, t0, t1, speaker, retryCount + 1);
       }
       
@@ -216,54 +219,75 @@ export default function Home() {
     }
   }, [targetLanguage]);
 
+  // 🔥 QUAN TRỌNG: Translation với Sequential và Debounce để tránh rate limit
   useEffect(() => {
+    let isCancelled = false;
+    let timeoutId: NodeJS.Timeout;
+
     const translateAllSegments = async () => {
-      if (transcripts.length === 0) {
-        setTranslatedSegments([]);
+      // Không dịch nếu không có transcript hoặc đang dịch
+      if (transcripts.length === 0 || isTranslating) {
         return;
       }
 
+      // Tìm các segment chưa được dịch
       const toTranslate = transcripts.filter(
         t => !translatedSegments.find(s => s.timestamp === t.timestamp)
       );
 
       if (toTranslate.length === 0) {
-        setIsTranslating(false);
         return;
       }
 
+      console.log(`🌐 Starting sequential translation for ${toTranslate.length} segments`);
       setIsTranslating(true);
-      const BATCH_SIZE = 5;
-      const newResults: TranslatedSegment[] = [];
 
-      for (let i = 0; i < toTranslate.length; i += BATCH_SIZE) {
-        const batch = toTranslate.slice(i, i + BATCH_SIZE);
-        const batchResults = await Promise.all(
-          batch.map(t => translateWithRetry(t.text, t.timestamp, t.t0, t.t1, t.speaker))
-        );
-        const validResults = batchResults.filter((r): r is TranslatedSegment => r !== null);
-        newResults.push(...validResults);
+      // 🔥 DỊCH TUẦN TỰ (SEQUENTIAL) thay vì Promise.all
+      for (let i = 0; i < toTranslate.length; i++) {
+        const t = toTranslate[i];
+        
+        // Thoát nếu component unmount
+        if (isCancelled) break;
 
-        if (i + BATCH_SIZE < toTranslate.length) {
-          await new Promise(resolve => setTimeout(resolve, 300));
+        console.log(`🔄 Translating segment ${i + 1}/${toTranslate.length}: "${t.text.substring(0, 50)}..."`);
+        
+        const result = await translateWithRetry(t.text, t.timestamp, t.t0, t.t1, t.speaker);
+        
+        if (result && !isCancelled) {
+          // Cập nhật ngay kết quả của từng câu lên giao diện
+          setTranslatedSegments(prev => {
+            if (prev.some(s => s.timestamp === result.timestamp)) return prev;
+            const newSegments = [...prev, result].sort((a, b) => a.t0 - b.t0);
+            console.log(`✅ Translation completed for timestamp ${result.timestamp}`);
+            return newSegments;
+          });
+        }
+
+        // 🔥 THROTTLE: Nghỉ 1 giây giữa các request để tránh rate limit
+        // Groq API free tier: ~1000 requests/phút, với 1 request/giây là an toàn
+        if (i < toTranslate.length - 1 && !isCancelled) {
+          await new Promise(resolve => setTimeout(resolve, 1000));
         }
       }
 
-      setTranslatedSegments(prev => {
-        const merged = [...prev];
-        for (const newSeg of newResults) {
-          if (!merged.find(s => s.timestamp === newSeg.timestamp)) {
-            merged.push(newSeg);
-          }
-        }
-        return merged.sort((a, b) => a.t0 - b.t0);
-      });
-
-      setIsTranslating(false);
+      if (!isCancelled) {
+        console.log(`🏁 Sequential translation completed for ${toTranslate.length} segments`);
+        setIsTranslating(false);
+      }
     };
 
-    translateAllSegments();
-  }, [transcripts, targetLanguage, translateWithRetry]);
+    // 🔥 DEBOUNCE: Chờ 1.5 giây sau khi có transcript mới bắt đầu dịch
+    // Giúp gom các câu lắt nhắt lại, tránh gọi API liên tục khi user đang nói
+    timeoutId = setTimeout(() => {
+      translateAllSegments();
+    }, 1500);
+
+    // Cleanup
+    return () => {
+      isCancelled = true;
+      clearTimeout(timeoutId);
+    };
+  }, [transcripts, targetLanguage, translateWithRetry, isTranslating, translatedSegments]);
 
   // Diarization
   const runDiarization = useCallback(async (audioFilePath: string) => {
@@ -362,8 +386,8 @@ export default function Home() {
         flushTranscriptBuffer();
       }
       
-      console.log("⏳ Chờ file WAV đóng (2s)...");
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      console.log("⏳ Chờ file WAV đóng (1s)...");
+      await new Promise(resolve => setTimeout(resolve, 1000));
       setLastAudioFile(audioPath);
 
       if (enableDiarization) {
@@ -576,6 +600,7 @@ export default function Home() {
     }
   }, [isRecording]);
 
+  // Xử lý transcript real-time không chờ timeout
   useEffect(() => {
     let unlistenFn: (() => void) | undefined;
 
@@ -587,7 +612,7 @@ export default function Home() {
           const t1 = payload.t1 ?? 0;
           const seq = payload.seq ?? 0;
 
-          console.log(`📝 [FRONTEND] Received: seq=${seq}, t0=${t0.toFixed(2)}s`);
+          console.log(`📝 [FRONTEND] Received: seq=${seq}, t0=${t0.toFixed(2)}s, text="${payload.text.substring(0, 50)}"`);
           
           const newTranscript: TranscriptWithSpeaker = {
             id: `${seq}-${Date.now()}`,
