@@ -1,4 +1,3 @@
-# backend/app/model_config.py
 from typing import List, Dict, Any, Optional
 import logging
 from datetime import datetime
@@ -13,21 +12,21 @@ class ModelManager:
     def __init__(self):
         self.models = {
             "primary": {
-                "name": "phi3:mini",  # Đổi primary thành phi3:mini (nhanh hơn, ít lỗi function calling)
-                "provider": "ollama",
+                "name": "llama-3.3-70b-versatile",  # Groq model
+                "provider": "groq",
                 "priority": 1,
-                "timeout": 45,  # 45 seconds timeout
+                "timeout": 45,
                 "max_retries": 3,
-                "description": "Lightweight model - fast, good for simple tasks",
-                "context_length": 4096,
+                "description": "Groq API - Llama 3.3 70B (Primary - Fastest)",
+                "context_length": 8192,
             },
             "fallback": {
-                "name": "llama3.2:latest",  # Chuyển llama3.2 thành fallback
+                "name": "qwen2.5:7b-instruct",  # Qwen 2.5 7B via Ollama
                 "provider": "ollama",
                 "priority": 2,
-                "timeout": 60,  # 60 seconds timeout
+                "timeout": 120,
                 "max_retries": 2,
-                "description": "Standard model - fallback for complex tasks",
+                "description": "Ollama Local - Qwen 2.5 7B (Fallback)",
                 "context_length": 8192,
             },
         }
@@ -57,6 +56,7 @@ class ModelManager:
                 if model["name"] == preferred_model:
                     if self.model_stats[key]["is_available"]:
                         logger.info(f"Using preferred model: {model['name']}")
+                        self.current_model = key  # ✅ Cập nhật current_model
                         return {"key": key, "config": model}
                     else:
                         logger.warning(
@@ -77,7 +77,10 @@ class ModelManager:
                     )
                     return self._get_fallback_model()
 
-            logger.info(f"Using primary model: {self.models[primary_key]['name']}")
+            logger.info(
+                f"Using primary model: {self.models[primary_key]['name']} (provider: {self.models[primary_key]['provider']})"
+            )
+            self.current_model = primary_key  # ✅ Cập nhật current_model
             return {"key": primary_key, "config": self.models[primary_key]}
 
         # Nếu primary unavailable, dùng fallback
@@ -87,12 +90,16 @@ class ModelManager:
         """Lấy fallback model"""
         fallback_key = "fallback"
         if self.model_stats[fallback_key]["is_available"]:
-            logger.info(f"Using fallback model: {self.models[fallback_key]['name']}")
+            logger.info(
+                f"Using fallback model: {self.models[fallback_key]['name']} (provider: {self.models[fallback_key]['provider']})"
+            )
+            self.current_model = fallback_key  # ✅ Cập nhật current_model
             return {"key": fallback_key, "config": self.models[fallback_key]}
 
         # Nếu fallback cũng unavailable, reset cả hai và thử lại
         self.reset_all_models()
         logger.warning("All models unavailable, resetting and using primary")
+        self.current_model = "primary"  # ✅ Cập nhật current_model
         return {"key": "primary", "config": self.models["primary"]}
 
     def reset_all_models(self):
@@ -143,7 +150,15 @@ class ModelManager:
 
     def get_current_model_name(self) -> str:
         """Lấy tên model hiện tại"""
-        return self.models[self.current_model]["name"]
+        if self.current_model in self.models:
+            return self.models[self.current_model]["name"]
+        return "unknown"
+
+    def get_current_provider(self) -> str:
+        """Lấy provider của model hiện tại"""
+        if self.current_model in self.models:
+            return self.models[self.current_model]["provider"]
+        return "unknown"
 
     def get_model_info(self) -> Dict:
         """Lấy thông tin về tất cả models"""
@@ -152,12 +167,14 @@ class ModelManager:
             stats = self.model_stats[key]
             info[key] = {
                 "name": model["name"],
+                "provider": model["provider"],
                 "available": stats["is_available"],
                 "success_rate": self._get_success_rate(key),
                 "avg_response_time": round(stats["avg_response_time"], 2),
                 "description": model["description"],
                 "timeout": model["timeout"],
                 "context_length": model["context_length"],
+                "is_current": (key == self.current_model),  # ✅ Thêm flag này
             }
         return info
 
@@ -222,6 +239,7 @@ class ModelManager:
                 "error_count": model_stats["error_count"],
                 "avg_response_time": round(model_stats["avg_response_time"], 2),
                 "is_available": model_stats["is_available"],
+                "is_current": (key == self.current_model),  # ✅ Thêm flag này
                 "last_used": (
                     model_stats["last_used"].isoformat()
                     if model_stats["last_used"]
@@ -229,6 +247,16 @@ class ModelManager:
                 ),
             }
         return stats
+
+    def get_current_model_config(self) -> Dict:
+        """Lấy config của model hiện tại"""
+        if self.current_model in self.models:
+            return {
+                "key": self.current_model,
+                "config": self.models[self.current_model],
+                "stats": self.model_stats[self.current_model],
+            }
+        return None
 
 
 # Khởi tạo global model manager
@@ -238,5 +266,8 @@ model_manager = ModelManager()
 logger.info(f"Model Manager initialized with {len(model_manager.models)} models")
 for key, model in model_manager.models.items():
     logger.info(
-        f"  - {key}: {model['name']} (timeout: {model['timeout']}s, priority: {model['priority']})"
+        f"  - {key}: {model['name']} (provider: {model['provider']}, timeout: {model['timeout']}s, priority: {model['priority']})"
     )
+logger.info(
+    f"Current model: {model_manager.get_current_model_name()} (provider: {model_manager.get_current_provider()})"
+)

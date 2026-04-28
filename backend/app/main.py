@@ -8,13 +8,12 @@ import logging
 from datetime import datetime
 import os
 from dotenv import load_dotenv
-import asyncio
-from functools import partial
 import json
 from threading import Lock
 import uuid
 import tempfile
 import sys
+import time
 
 # Thêm thư mục backend vào Python path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -30,11 +29,15 @@ from .Process_transcrip import (
     RunContext,
     Section,
     Block,
+    processor as global_processor,
+    summarizer as global_summarizer,
+    initialize_agent_with_model,
 )
 from .translation import TranslationService
 from .whisperx_service import WhisperXService
 from .models.user_map import meeting_directory
 from .services.speaker_mapper import map_speakers_to_real_names, get_all_speakers
+from .model_config import model_manager
 
 # Load environment variables
 load_dotenv()
@@ -88,16 +91,8 @@ class TranscriptRequest(BaseModel):
     text: str
     model: str
     model_name: str
-    chunk_size: Optional[int] = 5000
+    chunk_size: Optional[int] = 20000
     overlap: Optional[int] = 1000
-
-
-class TranscriptResponse(BaseModel):
-    """Response model for transcript processing"""
-
-    message: str
-    num_chunks: int
-    data: Dict[str, Any]
 
 
 class MappingRequest(BaseModel):
@@ -108,7 +103,7 @@ class MappingRequest(BaseModel):
     email: str
 
 
-# 🔥 THÊM: Request model cho local diarization
+# Request model cho local diarization
 class LocalDiarizeRequest(BaseModel):
     file_path: str
 
@@ -121,16 +116,24 @@ class SummaryProcessor:
             self.db = DatabaseManager()
             self._lock = Lock()
 
-            # Load API key and validate
-            api_key = os.getenv("ANTHROPIC_API_KEY")
+            api_key = os.getenv("GROQ_API_KEY")
             if not api_key:
-                logger.error("ANTHROPIC_API_KEY environment variable not set")
-                raise ValueError("ANTHROPIC_API_KEY environment variable not set")
+                logger.warning("GROQ_API_KEY environment variable not set!")
+                logger.warning(
+                    "System will attempt to use local Ollama fallback if available."
+                )
+            else:
+                logger.info("GROQ_API_KEY loaded successfully")
 
             logger.info("Initializing SummaryProcessor components")
-            self.transcript_processor = TranscriptProcessor()
-            self.summarizer = MeetingSummarizer(api_key)
-            self.agent = Agent(model=self.summarizer.model, system_prompt=SYSTEM_PROMPT)
+
+            # Sử dụng global processor và summarizer từ Process_transcrip
+            self.transcript_processor = global_processor
+            self.summarizer = global_summarizer
+
+            # Khởi tạo agent với model phù hợp
+            self.agent, _ = initialize_agent_with_model(api_key)
+
             self.collection = None
             self.final_summary_result = None
             logger.info("SummaryProcessor initialized successfully")
@@ -145,7 +148,7 @@ class SummaryProcessor:
         text: str,
         model: str,
         model_name: str,
-        chunk_size: int = 5000,
+        chunk_size: int = 20000,
         overlap: int = 1000,
     ) -> tuple:
         """Process a transcript text"""
@@ -153,27 +156,7 @@ class SummaryProcessor:
             if not text:
                 raise ValueError("Empty transcript text provided")
 
-            if chunk_size <= 0:
-                raise ValueError("chunk_size must be positive")
-            if overlap < 0:
-                raise ValueError("overlap must be non-negative")
-            if overlap >= chunk_size:
-                overlap = chunk_size - 1
-
-            step_size = chunk_size - overlap
-            if step_size <= 0:
-                chunk_size = overlap + 1
-
-            logger.info("Initializing ChromaDB collection")
-            self.transcript_processor.initialize_collection()
-            self.collection = self.transcript_processor.collection
-
-            if not self.collection:
-                raise ValueError("Failed to initialize ChromaDB collection")
-
-            logger.info(
-                f"Processing transcript of length {len(text)} with chunk_size={chunk_size}, overlap={overlap}"
-            )
+            logger.info(f"Processing transcript of length {len(text)}")
             num_chunks, all_json_data = (
                 await self.transcript_processor.process_transcript(
                     text=text,
@@ -184,107 +167,9 @@ class SummaryProcessor:
                 )
             )
             logger.info(f"Successfully processed transcript into {num_chunks} chunks")
-
             return num_chunks, all_json_data
         except Exception as e:
             logger.error(f"Error processing transcript: {str(e)}", exc_info=True)
-            raise
-
-    async def process_summary(self, process_id: str) -> Dict[str, Any]:
-        """Process a summary in a thread-safe way"""
-        try:
-            logger.info(f"Processing summary for process {process_id}")
-            if not self.collection:
-                logger.info("Initializing ChromaDB collection")
-                self.transcript_processor.initialize_collection()
-                self.collection = self.transcript_processor.collection
-
-                if not self.collection:
-                    raise ValueError("Failed to initialize ChromaDB collection")
-
-            logger.info("Running agent to generate summary")
-            try:
-                run_result = await self.agent.run(
-                    "What is the summary of the following meeting? Use tools to get the data"
-                )
-                logger.info("Successfully received model response")
-
-                if not run_result or not hasattr(run_result, "data"):
-                    raise ValueError("Invalid response from agent: missing data")
-
-                total_summary_in_pydantic = self.summarizer.generate_summary(
-                    run_result.data
-                )
-
-                if not any(
-                    [
-                        total_summary_in_pydantic.Agenda.blocks,
-                        total_summary_in_pydantic.Decisions.blocks,
-                        total_summary_in_pydantic.ActionItems.blocks,
-                        total_summary_in_pydantic.ClosingRemarks.blocks,
-                    ]
-                ):
-                    raise ValueError("No content found in summary")
-
-                json_data = total_summary_in_pydantic.model_dump_json(indent=2)
-                raw_summary = json.loads(json_data)
-
-                formatted_summary = {}
-                for section_name, section_data in raw_summary.items():
-                    formatted_blocks = []
-                    for block in section_data.get("blocks", []):
-                        formatted_block = {
-                            "id": block.get("id", str(uuid.uuid4())),
-                            "type": block.get("type", "text"),
-                            "content": block.get("content", ""),
-                            "color": block.get("color", "default"),
-                        }
-                        formatted_blocks.append(formatted_block)
-
-                    formatted_summary[section_name] = {
-                        "title": section_data.get("title", section_name),
-                        "blocks": formatted_blocks,
-                    }
-
-                result = {
-                    "summary": formatted_summary,
-                    "usage": {
-                        "requests": (
-                            run_result._usage.requests
-                            if hasattr(run_result, "_usage")
-                            else 0
-                        ),
-                        "request_tokens": (
-                            run_result._usage.request_tokens
-                            if hasattr(run_result, "_usage")
-                            else 0
-                        ),
-                        "response_tokens": (
-                            run_result._usage.response_tokens
-                            if hasattr(run_result, "_usage")
-                            else 0
-                        ),
-                        "total_tokens": (
-                            run_result._usage.total_tokens
-                            if hasattr(run_result, "_usage")
-                            else 0
-                        ),
-                    },
-                }
-
-                logger.info(f"Successfully generated summary for process {process_id}")
-                return result
-
-            except Exception as e:
-                logger.error(f"Error running agent: {str(e)}", exc_info=True)
-                if "empty model response" in str(e).lower():
-                    raise ValueError(
-                        "Empty model response received. This may indicate an issue with the API key or model configuration."
-                    )
-                raise
-
-        except Exception as e:
-            logger.error(f"Error processing summary: {str(e)}", exc_info=True)
             raise
 
     def cleanup(self):
@@ -305,24 +190,26 @@ translation_service = TranslationService()
 whisperx_service = None
 
 
-# Define tools
+# Define tools using processor's agent
 @processor.agent.tool
 async def query_transcript(ctx: RunContext, query: str) -> str:
     """Query the transcript to extract information. Returns the content and chunk IDs for deletion."""
     try:
         logger.info(f"Querying transcript with: {query}")
 
-        if not processor.collection:
+        if not processor.transcript_processor.collection:
             logger.error("No ChromaDB collection available")
             return "Error: No transcript loaded. Please process a transcript first."
 
-        collection_data = processor.collection.get()
+        collection_data = processor.transcript_processor.collection.get()
         if not collection_data["ids"]:
             logger.info("No chunks left to process")
             return "CHROMADB_EMPTY: All chunks have been processed."
 
         logger.info("Querying ChromaDB for relevant chunks")
-        results = processor.collection.query(query_texts=[query], n_results=1)
+        results = processor.transcript_processor.collection.query(
+            query_texts=[query], n_results=1
+        )
 
         if not results or not results["documents"] or not results["documents"][0]:
             logger.info("No results found for query")
@@ -340,8 +227,8 @@ async def query_transcript(ctx: RunContext, query: str) -> str:
         if chunk_ids:
             try:
                 logger.info(f"Deleting {len(chunk_ids)} processed chunks")
-                processor.collection.delete(ids=chunk_ids)
-                remaining = processor.collection.get()
+                processor.transcript_processor.collection.delete(ids=chunk_ids)
+                remaining = processor.transcript_processor.collection.get()
                 logger.info(f"Remaining chunks: {len(remaining['ids'])}")
             except Exception as e:
                 logger.error(f"Error deleting chunks: {str(e)}", exc_info=True)
@@ -362,7 +249,7 @@ async def delete_processed_chunks(ctx: RunContext) -> str:
             return "No chunks to delete"
 
         chunk_ids = list(ctx.processed_chunks)
-        processor.collection.delete(ids=chunk_ids)
+        processor.transcript_processor.collection.delete(ids=chunk_ids)
         ctx.processed_chunks.clear()
         return f"Successfully deleted {len(chunk_ids)} chunks"
 
@@ -411,6 +298,20 @@ async def add_decision(ctx: RunContext, title: str, content: str) -> str:
 
 
 @processor.agent.tool
+async def add_individual_task(
+    ctx: RunContext, assignee: str, task: str, deadline: str = None
+) -> str:
+    """Add a task assigned to a specific individual"""
+    try:
+        logger.info(f"Adding individual task for {assignee}: {task}")
+        result = processor.summarizer.add_individual_task(ctx, assignee, task, deadline)
+        return result
+    except Exception as e:
+        logger.error(f"Error adding individual task: {str(e)}", exc_info=True)
+        return f"Error adding individual task: {str(e)}"
+
+
+@processor.agent.tool
 async def save_final_summary_result(ctx: RunContext) -> str:
     """Save the final meeting summary result to a file"""
     try:
@@ -422,15 +323,15 @@ async def save_final_summary_result(ctx: RunContext) -> str:
                 summary.Decisions.blocks,
                 summary.ActionItems.blocks,
                 summary.ClosingRemarks.blocks,
+                summary.IndividualTasks.blocks,
             ]
         ):
             return "Error: No content found in summary. Please add some items first."
 
         json_data = summary.model_dump_json(indent=2)
-        self.final_summary_result = json_data
 
         try:
-            with open("final_summary_result.json", "w") as f:
+            with open("final_summary_result.json", "w", encoding="utf-8") as f:
                 f.write(json_data)
             return "Successfully saved final summary result to file"
         except IOError as e:
@@ -455,81 +356,168 @@ async def get_final_summary(ctx: RunContext) -> SummaryResponse:
         raise
 
 
+async def process_and_save_summary(
+    process_id: str, all_json_data: List[str]
+) -> Dict[str, Any]:
+    """Process JSON chunks and save final summary to database"""
+    final_summary = {
+        "MeetingName": "",
+        "SectionSummary": {"title": "Section Summary", "blocks": []},
+        "CriticalDeadlines": {"title": "Critical Deadlines", "blocks": []},
+        "KeyItemsDecisions": {"title": "Key Items & Decisions", "blocks": []},
+        "ImmediateActionItems": {"title": "Immediate Action Items", "blocks": []},
+        "NextSteps": {"title": "Next Steps", "blocks": []},
+        "OtherImportantPoints": {"title": "Other Important Points", "blocks": []},
+        "ClosingRemarks": {"title": "Closing Remarks", "blocks": []},
+        # 🔥 THÊM MỤC INDIVIDUAL TASKS
+        "IndividualTasks": {"title": "Individual Tasks (Assignment)", "blocks": []},
+    }
+
+    for json_str in all_json_data:
+        json_dict = json.loads(json_str)
+
+        if json_dict.get("MeetingName") and not final_summary["MeetingName"]:
+            final_summary["MeetingName"] = json_dict["MeetingName"]
+        final_summary["SectionSummary"]["blocks"].extend(
+            json_dict.get("SectionSummary", {}).get("blocks", [])
+        )
+        final_summary["CriticalDeadlines"]["blocks"].extend(
+            json_dict.get("CriticalDeadlines", {}).get("blocks", [])
+        )
+        final_summary["KeyItemsDecisions"]["blocks"].extend(
+            json_dict.get("KeyItemsDecisions", {}).get("blocks", [])
+        )
+        final_summary["ImmediateActionItems"]["blocks"].extend(
+            json_dict.get("ImmediateActionItems", {}).get("blocks", [])
+        )
+        final_summary["NextSteps"]["blocks"].extend(
+            json_dict.get("NextSteps", {}).get("blocks", [])
+        )
+        final_summary["OtherImportantPoints"]["blocks"].extend(
+            json_dict.get("OtherImportantPoints", {}).get("blocks", [])
+        )
+        final_summary["ClosingRemarks"]["blocks"].extend(
+            json_dict.get("ClosingRemarks", {}).get("blocks", [])
+        )
+        # 🔥 THÊM DÒNG NÀY ĐỂ GỘP CÁC BLOCK TASK TỪ CÁC CHUNK
+        final_summary["IndividualTasks"]["blocks"].extend(
+            json_dict.get("IndividualTasks", {}).get("blocks", [])
+        )
+
+    if final_summary["MeetingName"]:
+        await processor.db.update_meeting_name(process_id, final_summary["MeetingName"])
+
+    await processor.db.update_process(
+        process_id, status="completed", result=json.dumps(final_summary)
+    )
+
+    return final_summary
+
+
 async def process_transcript_background(process_id: str, transcript: TranscriptRequest):
-    """Background task to process transcript"""
+    """Background task to process transcript with fallback support"""
+    start_time = time.time()
+    current_model_key = model_manager.current_model
+    fallback_attempted = False
+
     try:
         logger.info(f"Starting background processing for process_id: {process_id}")
 
-        deps = {
-            "db": processor.db,
-            "transcript_processor": processor.transcript_processor,
-            "summarizer": processor.summarizer,
-        }
-
-        ctx = RunContext(
-            deps=deps, model=processor.summarizer.model, usage={}, prompt=SYSTEM_PROMPT
-        )
-        ctx.process_id = process_id
-
-        num_chunks, all_json_data = (
-            await processor.transcript_processor.process_transcript(
-                text=transcript.text,
-                model=transcript.model,
-                model_name=transcript.model_name,
-                chunk_size=transcript.chunk_size,
-                overlap=transcript.overlap,
-            )
+        # Process transcript
+        num_chunks, all_json_data = await processor.process_transcript(
+            text=transcript.text,
+            model=transcript.model,
+            model_name=transcript.model_name,
+            chunk_size=transcript.chunk_size,
+            overlap=transcript.overlap,
         )
 
-        final_summary = {
-            "MeetingName": "",
-            "SectionSummary": {"title": "Section Summary", "blocks": []},
-            "CriticalDeadlines": {"title": "Critical Deadlines", "blocks": []},
-            "KeyItemsDecisions": {"title": "Key Items & Decisions", "blocks": []},
-            "ImmediateActionItems": {"title": "Immediate Action Items", "blocks": []},
-            "NextSteps": {"title": "Next Steps", "blocks": []},
-            "OtherImportantPoints": {"title": "Other Important Points", "blocks": []},
-            "ClosingRemarks": {"title": "Closing Remarks", "blocks": []},
-        }
+        # Save summary to database
+        await process_and_save_summary(process_id, all_json_data)
 
-        for json_str in all_json_data:
-            json_dict = json.loads(json_str)
-            if json_dict.get("MeetingName") and not final_summary["MeetingName"]:
-                final_summary["MeetingName"] = json_dict["MeetingName"]
-            final_summary["SectionSummary"]["blocks"].extend(
-                json_dict.get("SectionSummary", {}).get("blocks", [])
-            )
-            final_summary["CriticalDeadlines"]["blocks"].extend(
-                json_dict.get("CriticalDeadlines", {}).get("blocks", [])
-            )
-            final_summary["KeyItemsDecisions"]["blocks"].extend(
-                json_dict.get("KeyItemsDecisions", {}).get("blocks", [])
-            )
-            final_summary["ImmediateActionItems"]["blocks"].extend(
-                json_dict.get("ImmediateActionItems", {}).get("blocks", [])
-            )
-            final_summary["NextSteps"]["blocks"].extend(
-                json_dict.get("NextSteps", {}).get("blocks", [])
-            )
-            final_summary["OtherImportantPoints"]["blocks"].extend(
-                json_dict.get("OtherImportantPoints", {}).get("blocks", [])
-            )
-            final_summary["ClosingRemarks"]["blocks"].extend(
-                json_dict.get("ClosingRemarks", {}).get("blocks", [])
-            )
-
-        if final_summary["MeetingName"]:
-            await processor.db.update_meeting_name(
-                process_id, final_summary["MeetingName"]
-            )
-
-        await processor.db.update_process(
-            process_id, status="completed", result=json.dumps(final_summary)
+        # Cập nhật thống kê thành công
+        total_duration = time.time() - start_time
+        model_manager.update_stats(
+            current_model_key, success=True, response_time=total_duration
         )
+
         logger.info(f"Background processing completed for process_id: {process_id}")
 
     except Exception as e:
         error_msg = str(e)
+        total_duration = time.time() - start_time
+
+        # Cập nhật thống kê thất bại cho primary model
+        model_manager.update_stats(
+            current_model_key,
+            success=False,
+            response_time=total_duration,
+            error_msg=error_msg,
+        )
+
+        # KIỂM TRA FALLBACK
+        if not fallback_attempted and model_manager.should_retry_with_fallback(
+            current_model_key, e
+        ):
+            logger.warning(
+                f"Primary model failed, attempting fallback for process {process_id}"
+            )
+
+            # Lấy fallback model
+            fallback_info = await model_manager.get_available_model()
+            if fallback_info["key"] != current_model_key:
+                logger.info(
+                    f"Retrying with fallback model: {fallback_info['config']['name']}"
+                )
+                fallback_attempted = True
+                fallback_start_time = time.time()
+
+                try:
+                    # Retry với fallback model
+                    fallback_transcript = TranscriptRequest(
+                        text=transcript.text,
+                        model=fallback_info["config"]["provider"],
+                        model_name=fallback_info["config"]["name"],
+                        chunk_size=transcript.chunk_size,
+                        overlap=transcript.overlap,
+                    )
+
+                    # Gọi lại process_transcript với fallback
+                    num_chunks, all_json_data = await processor.process_transcript(
+                        text=fallback_transcript.text,
+                        model=fallback_transcript.model,
+                        model_name=fallback_transcript.model_name,
+                        chunk_size=fallback_transcript.chunk_size,
+                        overlap=fallback_transcript.overlap,
+                    )
+
+                    # LƯU KẾT QUẢ FALLBACK VÀO DATABASE
+                    await process_and_save_summary(process_id, all_json_data)
+
+                    # Cập nhật thống kê cho fallback model
+                    fallback_duration = time.time() - fallback_start_time
+                    model_manager.update_stats(
+                        fallback_info["key"],
+                        success=True,
+                        response_time=fallback_duration,
+                    )
+
+                    logger.info(
+                        f"✅ Fallback processing successful for process {process_id}"
+                    )
+                    return  # Thoát thành công
+
+                except Exception as fallback_error:
+                    logger.error(f"❌ Fallback also failed: {str(fallback_error)}")
+                    # Cập nhật thống kê thất bại cho fallback
+                    model_manager.update_stats(
+                        fallback_info["key"],
+                        success=False,
+                        response_time=time.time() - fallback_start_time,
+                        error_msg=str(fallback_error),
+                    )
+
+        # Nếu đến được đây, cả primary và fallback đều thất bại
         logger.error(f"Error in background processing for {process_id}: {error_msg}")
         await processor.db.update_process(process_id, status="failed", error=error_msg)
 
@@ -632,9 +620,9 @@ async def get_summary(process_id: str):
 @app.post("/upload-transcript")
 async def upload_transcript(
     background_tasks: BackgroundTasks,
-    model: str = "claude",
-    model_name: str = "claude-3-5-sonnet-latest",
-    chunk_size: Optional[int] = 5000,
+    model: str = "groq",
+    model_name: str = "llama-3.3-70b-versatile",
+    chunk_size: Optional[int] = 20000,
     overlap: Optional[int] = 1000,
     file: UploadFile = File(...),
 ) -> Dict[str, str]:
@@ -664,34 +652,22 @@ async def upload_transcript(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/start-summarization")
-async def start_summarization(background_tasks: BackgroundTasks) -> Dict[str, str]:
-    """Start the summarization process"""
-    logger.info("Received request to start summarization")
+# ==================== MODEL STATUS ENDPOINT ====================
+@app.get("/model-status")
+async def get_model_status():
+    """Lấy trạng thái hiện tại của model manager"""
     try:
-        process_id = await processor.db.create_process()
-        logger.info(f"Created process with ID: {process_id}")
-        background_tasks.add_task(process_and_update, process_id)
-        logger.info(f"Added background task for process {process_id}")
-        return {"process_id": process_id}
+        return {
+            "status": "success",
+            "current_model": model_manager.get_current_model_name(),
+            "current_provider": model_manager.get_current_provider(),
+            "models": model_manager.get_model_info(),
+            "statistics": model_manager.get_statistics(),
+            "timestamp": datetime.now().isoformat(),
+        }
     except Exception as e:
-        logger.error(f"Error in start_summarization: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-async def process_and_update(process_id: str):
-    """Process the summary and update the database"""
-    logger.info(f"Starting background processing for {process_id}")
-    try:
-        result = await processor.process_summary(process_id)
-        logger.info(f"Generated summary for {process_id}")
-        await processor.db.update_process(process_id, "COMPLETED", result=result)
-        logger.info(f"Updated process {process_id} as completed")
-    except Exception as e:
-        logger.error(
-            f"Error in process_and_update for {process_id}: {str(e)}", exc_info=True
-        )
-        await processor.db.update_process(process_id, "FAILED", error=str(e))
+        logger.error(f"Error getting model status: {e}")
+        return {"status": "error", "error": str(e)}
 
 
 # ==================== STARTUP & SHUTDOWN EVENTS ====================
@@ -752,8 +728,6 @@ async def translate_text(request: dict):
 
 
 # ==================== WHISPERX DIARIZATION ENDPOINTS ====================
-
-
 @app.post("/diarize")
 async def diarize_audio(file: UploadFile = File(...)):
     """Nhận diện người nói từ file audio (dùng WhisperX) và tự động map tên"""
@@ -787,7 +761,7 @@ async def diarize_audio(file: UploadFile = File(...)):
             os.unlink(tmp_path)
 
 
-# 🔥 API MỚI: Nhận đường dẫn file thay vì file blob
+# API mới: Nhận đường dẫn file thay vì file blob
 @app.post("/diarize-local")
 async def diarize_local_audio(req: LocalDiarizeRequest):
     """Nhận đường dẫn file từ Frontend và tự đọc từ ổ cứng"""
@@ -806,10 +780,10 @@ async def diarize_local_audio(req: LocalDiarizeRequest):
     try:
         logger.info(f"📦 Backend trực tiếp đọc file từ: {req.file_path}")
 
-        # 1. Gọi trực tiếp whisperx_service đọc file từ ổ cứng
+        # Gọi trực tiếp whisperx_service đọc file từ ổ cứng
         raw_result = await whisperx_service.process_audio(req.file_path)
 
-        # 2. Map tên thật từ danh bạ
+        # Map tên thật từ danh bạ
         mapped_result = map_speakers_to_real_names(raw_result)
 
         return JSONResponse(content=mapped_result)

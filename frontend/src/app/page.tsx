@@ -62,9 +62,9 @@ export default function Home() {
   });
   const [summaryError, setSummaryError] = useState<string | null>(null);
   const [modelConfig, setModelConfig] = useState<ModelConfig>({
-    provider: 'ollama',
-    model: 'llama3.2:latest',
-    whisperModel: 'large-v3'
+    provider: 'groq',
+    model: 'llama-3.3-70b-versatile',
+    whisperModel: 'large-v3-turbo'
   });
   const [originalTranscript, setOriginalTranscript] = useState<string>('');
   const [models, setModels] = useState<OllamaModel[]>([]);
