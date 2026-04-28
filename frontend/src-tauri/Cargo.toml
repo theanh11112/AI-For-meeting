@@ -71,6 +71,7 @@ rand = "0.8.5"
 rubato = "0.15.0"
 
 ffmpeg-sidecar = { git = "https://github.com/nathanbabcock/ffmpeg-sidecar", branch = "main" }
+tauri-plugin-fs = "2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 once_cell = "1.17.1"

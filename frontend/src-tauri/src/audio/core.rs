@@ -1,9 +1,9 @@
-use super::audio_processing::audio_to_mono; 
+use super::audio_processing::audio_to_mono;
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::StreamError;
 use lazy_static::lazy_static;
-use log::{ error, info, warn};
+use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -164,7 +164,6 @@ pub async fn get_device_and_config(
     };
     Ok((cpal_audio_device, config))
 }
-
 
 pub async fn list_audio_devices() -> Result<Vec<AudioDevice>> {
     let host = cpal::default_host();
@@ -436,7 +435,7 @@ impl AudioStream {
     pub async fn stop(&self) -> Result<()> {
         // Mark as disconnected first
         self.is_disconnected.store(true, Ordering::Release);
-        
+
         // Send stop signal and wait for confirmation
         let (tx, rx) = oneshot::channel();
         self.stream_control.send(StreamControl::Stop(tx))?;

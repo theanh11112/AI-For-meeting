@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 import uvicorn
 from typing import Optional, Dict, Any, List
@@ -14,6 +14,12 @@ import uuid
 import tempfile
 import sys
 import time
+import httpx
+from groq import Groq
+import smtplib
+import asyncio
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 # Thêm thư mục backend vào Python path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -369,7 +375,6 @@ async def process_and_save_summary(
         "NextSteps": {"title": "Next Steps", "blocks": []},
         "OtherImportantPoints": {"title": "Other Important Points", "blocks": []},
         "ClosingRemarks": {"title": "Closing Remarks", "blocks": []},
-        # 🔥 THÊM MỤC INDIVIDUAL TASKS
         "IndividualTasks": {"title": "Individual Tasks (Assignment)", "blocks": []},
     }
 
@@ -399,7 +404,6 @@ async def process_and_save_summary(
         final_summary["ClosingRemarks"]["blocks"].extend(
             json_dict.get("ClosingRemarks", {}).get("blocks", [])
         )
-        # 🔥 THÊM DÒNG NÀY ĐỂ GỘP CÁC BLOCK TASK TỪ CÁC CHUNK
         final_summary["IndividualTasks"]["blocks"].extend(
             json_dict.get("IndividualTasks", {}).get("blocks", [])
         )
@@ -828,6 +832,343 @@ async def delete_speaker_mapping(speaker_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ==================== COMPANY CONTEXT MANAGEMENT ====================
+COMPANY_CONTEXT_FILE = os.path.join(os.path.dirname(__file__), "company_context.txt")
+
+# Đảm bảo file tồn tại
+if not os.path.exists(COMPANY_CONTEXT_FILE):
+    with open(COMPANY_CONTEXT_FILE, "w", encoding="utf-8") as f:
+        f.write(
+            """Tên công ty: Meetily Corporation
+Người gửi: Thế Anh
+Chức danh: Giám đốc Điều hành (CEO)
+Email người gửi: ceo@meetily.com
+Giọng văn: Chuyên nghiệp, thân thiện, rõ ràng, dễ hiểu
+Lĩnh vực: Cung cấp giải pháp phần mềm AI và tự động hóa doanh nghiệp
+Thông điệp: Đồng hành cùng sự phát triển của đối tác
+Chữ ký mặc định: Trân trọng,"""
+        )
+
+
+class UpdateContextRequest(BaseModel):
+    content: str
+
+
+@app.get("/company-context")
+async def get_company_context():
+    """Lấy nội dung file context của công ty"""
+    try:
+        with open(COMPANY_CONTEXT_FILE, "r", encoding="utf-8") as f:
+            content = f.read()
+        return {"success": True, "content": content, "file_path": COMPANY_CONTEXT_FILE}
+    except Exception as e:
+        logger.error(f"Lỗi đọc file context: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/company-context")
+async def update_company_context(req: UpdateContextRequest):
+    """Cập nhật nội dung file context của công ty"""
+    try:
+        with open(COMPANY_CONTEXT_FILE, "w", encoding="utf-8") as f:
+            f.write(req.content)
+        logger.info("✅ Đã cập nhật company context")
+        return {"success": True, "message": "Đã cập nhật context thành công"}
+    except Exception as e:
+        logger.error(f"Lỗi ghi file context: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/company-context/download")
+async def download_company_context():
+    """Tải file context về máy"""
+    try:
+        with open(COMPANY_CONTEXT_FILE, "r", encoding="utf-8") as f:
+            content = f.read()
+        return PlainTextResponse(
+            content=content,
+            media_type="text/plain",
+            headers={"Content-Disposition": "attachment; filename=company_context.txt"},
+        )
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# ==================== EMAIL AGENT ENDPOINTS ====================
+
+# Khởi tạo Groq client cho Email Agent
+email_groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+# Đọc config từ environment variables
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_TEMPERATURE = float(os.getenv("GROQ_TEMPERATURE", "0.7"))
+GROQ_MAX_TOKENS = int(os.getenv("GROQ_MAX_TOKENS", "4096"))
+
+# Gmail configuration
+GMAIL_USER = os.getenv("GMAIL_USER", "")
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
+
+
+# Request models cho Email Agent
+class GenerateEmailRequest(BaseModel):
+    meeting_summary: str
+    users_tasks: list
+    context_text: str = ""
+
+
+class SendEmailsRequest(BaseModel):
+    drafts: list
+
+
+async def get_company_context_text() -> str:
+    """Đọc company context từ file"""
+    try:
+        if os.path.exists(COMPANY_CONTEXT_FILE):
+            with open(COMPANY_CONTEXT_FILE, "r", encoding="utf-8") as f:
+                content = f.read()
+                if content and content.strip():
+                    return content
+    except Exception as e:
+        logger.error(f"Lỗi đọc company context: {e}")
+
+    # Default context nếu không có file
+    return """Tên công ty: Meetily Corporation
+Người gửi: Thế Anh
+Chức danh: Giám đốc Điều hành (CEO)
+Giọng văn: Chuyên nghiệp, thân thiện, rõ ràng
+Lĩnh vực: Cung cấp giải pháp phần mềm AI"""
+
+
+# Hàm Backup gọi Ollama Local
+async def call_ollama_fallback(system_prompt: str, user_prompt: str) -> str:
+    """Gọi Ollama Local qua REST API với định dạng JSON"""
+    ollama_url = f"{OLLAMA_HOST}/api/chat"
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "format": "json",
+        "stream": False,
+        "options": {"temperature": 0.7, "num_predict": GROQ_MAX_TOKENS},
+    }
+
+    logger.info(f"📡 Gọi Ollama Local: {OLLAMA_MODEL} tại {ollama_url}")
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        response = await client.post(ollama_url, json=payload)
+        response.raise_for_status()
+        data = response.json()
+        return data["message"]["content"]
+
+
+async def generate_drafts(
+    meeting_summary: str, users_tasks: list, context_text: str = ""
+):
+    drafts = []
+
+    # Lấy context từ file
+    file_context = await get_company_context_text()
+    final_context = (
+        file_context if file_context and file_context.strip() else context_text
+    )
+
+    system_prompt = f"""Bạn là AI Email Agent chuyên nghiệp. Soạn email giao việc với đầy đủ 3 phần:
+
+1. GIỚI THIỆU NGƯỜI VIẾT: Dựa vào context bên dưới
+2. TÓM TẮT CUỘC HỌP: Nêu ngắn gọn nội dung chính
+3. GIAO VIỆC CỤ THỂ: Liệt kê rõ ràng các task
+
+=== THÔNG TIN CÔNG TY & NGƯỜI VIẾT ===
+{final_context}
+
+=== TÓM TẮT NỘI DUNG CUỘC HỌP ===
+{meeting_summary}
+
+YÊU CẦU:
+- Email phải có đủ 3 phần: Giới thiệu + Tóm tắt cuộc họp + Giao việc
+- Ký tên đầy đủ: [Tên], [Chức danh], [Tên công ty]
+- Giọng văn chuyên nghiệp, lịch sự
+- Chỉ trả về JSON format: {{"subject": "tiêu đề", "body": "nội dung email"}}"""
+
+    for user in users_tasks:
+        tasks_list = []
+        for t in user["tasks"]:
+            deadline_text = (
+                f" (Hạn: {t['deadline']})"
+                if t.get("deadline") and t["deadline"] != "ASAP"
+                else ""
+            )
+            tasks_list.append(f"  • {t['task_name']}{deadline_text}")
+
+        tasks_text = "\n".join(tasks_list)
+
+        user_prompt = f"""Viết email cho: {user['name']} ({user['email']})
+
+CÔNG VIỆC ĐƯỢC GIAO CHO {user['name'].upper()}:
+{tasks_text}
+
+YÊU CẦU:
+1. Mở đầu: Giới thiệu bản thân theo context công ty
+2. Thân bài: Tóm tắt ngắn gọn nội dung cuộc họp (1-2 câu)
+3. Phần chính: Trình bày rõ ràng các task được giao
+4. Kết thúc: Khuyến khích, động viên và ký tên đầy đủ
+
+Viết bằng tiếng Việt, giọng văn thân thiện nhưng chuyên nghiệp."""
+
+        result_text = ""
+
+        # Thử gọi API của Groq trước
+        try:
+            response = email_groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=GROQ_TEMPERATURE,
+                max_tokens=GROQ_MAX_TOKENS,
+            )
+            result_text = response.choices[0].message.content
+            logger.info(
+                f"✅ Đã tạo email cho {user['name']} bằng GROQ API ({GROQ_MODEL})"
+            )
+
+        except Exception as groq_error:
+            logger.warning(
+                f"⚠️ Groq lỗi ({groq_error}). Chuyển sang dùng OLLAMA LOCAL cho {user['name']}..."
+            )
+
+            # Nếu Groq lỗi, gọi hàm Backup Ollama
+            try:
+                result_text = await call_ollama_fallback(system_prompt, user_prompt)
+                logger.info(
+                    f"✅ Đã tạo email cho {user['name']} bằng OLLAMA LOCAL ({OLLAMA_MODEL})"
+                )
+            except Exception as ollama_error:
+                logger.error(
+                    f"❌ Lỗi cả Groq và Ollama cho {user['name']}: {ollama_error}"
+                )
+                # Thêm draft mặc định nếu cả 2 đều sập
+                result_text = json.dumps(
+                    {
+                        "subject": f"Cập nhật công việc từ cuộc họp - {user['name']}",
+                        "body": f"""Kính gửi anh/chị {user['name']},
+
+{final_context.split(chr(10))[0] if 'Tên công ty:' in final_context else 'Công ty chúng tôi'} xin gửi đến anh/chị những công việc cần thực hiện sau cuộc họp hôm nay:
+
+**Công việc được giao:**
+{tasks_text}
+
+Rất mong anh/chị hoàn thành đúng thời hạn.
+
+{final_context.split(chr(10))[2] if 'Chức danh:' in final_context else 'Trân trọng,'}
+{final_context.split(chr(10))[1] if 'Người gửi:' in final_context else 'Ban Giám Đốc'}""",
+                    }
+                )
+
+        # Parse JSON và thêm vào danh sách
+        try:
+            result = json.loads(result_text)
+            drafts.append(
+                {
+                    "to_email": user["email"],
+                    "to_name": user["name"],
+                    "subject": result.get("subject", "Cập nhật công việc từ cuộc họp"),
+                    "body": result.get("body", "Nội dung trống do lỗi parse."),
+                }
+            )
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ Lỗi parse JSON cho {user['name']}: {e}")
+            logger.error(f"Raw response: {result_text[:500]}")
+            # Fallback draft nếu parse lỗi
+            drafts.append(
+                {
+                    "to_email": user["email"],
+                    "to_name": user["name"],
+                    "subject": f"Cập nhật công việc - {user['name']}",
+                    "body": f"""Kính gửi anh/chị {user['name']},
+
+Sau cuộc họp hôm nay, xin gửi đến anh/chị các công việc cần thực hiện:
+
+{tasks_text}
+
+Trân trọng,
+Ban Giám Đốc""",
+                }
+            )
+
+    return drafts
+
+
+# Hàm gửi email qua Gmail SMTP
+async def send_single_email(draft: dict):
+    """Gửi email sử dụng Gmail SMTP với App Password"""
+
+    if not GMAIL_USER or not GMAIL_APP_PASSWORD:
+        logger.error("❌ Chưa cấu hình GMAIL_USER hoặc GMAIL_APP_PASSWORD trong .env")
+        return {"status": "error", "error": "Missing Gmail config in .env"}
+
+    def _send_email_sync():
+        # Tạo cấu trúc email
+        msg = MIMEMultipart()
+        msg["From"] = f"Meetily AI <{GMAIL_USER}>"
+        msg["To"] = draft["to_email"]
+        msg["Subject"] = draft["subject"]
+
+        # Đính kèm nội dung email (text thuần, hỗ trợ tiếng Việt)
+        msg.attach(MIMEText(draft["body"], "plain", "utf-8"))
+
+        logger.info(f"📧 Đang kết nối tới Gmail để gửi cho {draft['to_email']}...")
+
+        # Kết nối an toàn qua cổng SSL của Google
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            # server.set_debuglevel(1)  # Bỏ comment nếu muốn xem log chi tiết
+            server.login(GMAIL_USER, GMAIL_APP_PASSWORD.replace(" ", ""))
+            server.send_message(msg)
+
+    try:
+        # Chạy I/O gửi mail trong một luồng (thread) riêng để không làm treo Backend
+        await asyncio.to_thread(_send_email_sync)
+        logger.info(f"✅ Đã gửi email thành công tới {draft['to_email']}")
+        return {"status": "success"}
+    except Exception as e:
+        logger.error(f"❌ Lỗi gửi Gmail tới {draft['to_email']}: {e}")
+        return {"status": "error", "error": str(e)}
+
+
+async def send_emails_background_task(drafts: list):
+    """Gửi nhiều email trong background"""
+    for draft in drafts:
+        await send_single_email(draft)
+
+
+@app.post("/generate-email-drafts")
+async def api_generate_drafts(req: GenerateEmailRequest):
+    try:
+        drafts = await generate_drafts(
+            req.meeting_summary, req.users_tasks, req.context_text
+        )
+        return {"success": True, "drafts": drafts}
+    except Exception as e:
+        logger.error(f"Lỗi API tạo draft: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/send-emails")
+async def api_send_emails(req: SendEmailsRequest, background_tasks: BackgroundTasks):
+    try:
+        background_tasks.add_task(send_emails_background_task, req.drafts)
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# ==================== MAIN ====================
 if __name__ == "__main__":
     import multiprocessing
 

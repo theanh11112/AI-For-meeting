@@ -12,6 +12,7 @@ import {
 import { EditableTitle } from '@/components/EditableTitle';
 import { RecordingControls } from '@/components/RecordingControls';
 import { AISummary } from '@/components/AISummary';
+import  EmailAgent  from '@/components/EmailAgent';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
@@ -21,6 +22,7 @@ import { LanguageSelector } from '@/components/Meeting/Controls/LanguageSelector
 import { SpeakerModal } from '@/components/Meeting/Modals/SpeakerModal';
 import { ModelSettingsModal } from '@/components/Meeting/Modals/ModelSettingsModal';
 import { formatTimeFromSeconds } from '@/utils/transcriptUtils';
+import CompanyContextManager from '@/components/CompanyContextManager';
 
 interface TranscriptUpdate {
   text: string;
@@ -38,6 +40,16 @@ interface OllamaModel {
   modified: string;
 }
 
+// Kiểm tra môi trường Tauri
+declare global {
+  interface Window {
+    __TAURI__?: any;
+  }
+}
+
+// Ngôn ngữ mặc định của transcript (nguồn)
+const SOURCE_LANGUAGE = 'en';
+
 export default function Home() {
   // States
   const [isRecording, setIsRecording] = useState(false);
@@ -54,12 +66,7 @@ export default function Home() {
   const [barHeights, setBarHeights] = useState(['58%', '76%', '58%']);
   const [meetingTitle, setMeetingTitle] = useState('New Call');
   const [isEditingTitle, setIsEditingTitle] = useState(false);
-  const [aiSummary, setAiSummary] = useState<Summary | null>({
-    key_points: { title: "Key Points", blocks: [] },
-    action_items: { title: "Action Items", blocks: [] },
-    decisions: { title: "Decisions", blocks: [] },
-    main_topics: { title: "Main Topics", blocks: [] }
-  });
+  const [aiSummary, setAiSummary] = useState<Summary | null>(null);
   const [summaryError, setSummaryError] = useState<string | null>(null);
   const [modelConfig, setModelConfig] = useState<ModelConfig>({
     provider: 'groq',
@@ -83,6 +90,10 @@ export default function Home() {
   const [editingSpeakerId, setEditingSpeakerId] = useState<string>('');
   const [speakerForm, setSpeakerForm] = useState({ name: '', email: '' });
   const [showModelSettings, setShowModelSettings] = useState(false);
+  const [showContextModal, setShowContextModal] = useState(false);
+
+  // --- STATE VÀ LOGIC CHO EMAIL AGENT ---
+  const [companyContext, setCompanyContext] = useState<string>("Đại diện Ban Giám Đốc công ty Meetily");
 
   const isStoppingRef = useRef(false);
   const { setCurrentMeeting } = useSidebar();
@@ -147,6 +158,26 @@ export default function Home() {
     fetchSpeakers();
   }, [fetchSpeakers]);
 
+  // Lấy thông tin ngữ cảnh công ty từ Backend API
+  useEffect(() => {
+    const loadContextInfo = async () => {
+      try {
+        const response = await fetch('http://localhost:5167/company-context');
+        const data = await response.json();
+        
+        if (data.success && data.content) {
+          setCompanyContext(data.content);
+          console.log("✅ Đã tải context từ Backend API");
+        } else {
+          console.log("📄 Không có context từ Backend, dùng giá trị mặc định");
+        }
+      } catch (err) {
+        console.log("📄 Lỗi kết nối Backend, dùng giá trị mặc định của Frontend.");
+      }
+    };
+    loadContextInfo();
+  }, []);
+
   const getSpeakerDisplayName = useCallback((speakerId: string): string => {
     const mapped = speakerMaps.find(s => s.speaker_id === speakerId);
     if (mapped) return mapped.name;
@@ -178,16 +209,11 @@ export default function Home() {
     }
   };
 
-  // Translation with retry logic
-  const translateWithRetry = useCallback(async (
-    text: string, 
-    timestamp: string, 
-    t0: number, 
-    t1: number, 
-    speaker?: string, 
-    retryCount: number = 0
-  ): Promise<TranslatedSegment | null> => {
+  // Hàm dịch
+  const translateSegment = useCallback(async (text: string, timestamp: string, t0: number, t1: number, speaker?: string) => {
     if (!text || text.trim() === '') return null;
+    // Nếu ngôn ngữ đích trùng với ngôn ngữ nguồn, không cần dịch
+    if (targetLanguage === SOURCE_LANGUAGE) return null;
     
     try {
       const response = await fetch('http://localhost:5167/translate', {
@@ -201,14 +227,6 @@ export default function Home() {
         })
       });
       
-      // Xử lý rate limit với exponential backoff
-      if (response.status === 429 && retryCount < 3) {
-        const delay = 2000 * Math.pow(2, retryCount);
-        console.log(`⚠️ Rate limit hit, waiting ${delay}ms (attempt ${retryCount + 1}/3)`);
-        await new Promise(resolve => setTimeout(resolve, delay));
-        return translateWithRetry(text, timestamp, t0, t1, speaker, retryCount + 1);
-      }
-      
       if (!response.ok) throw new Error(`Translation API error: ${response.status}`);
       
       const data = await response.json();
@@ -219,75 +237,51 @@ export default function Home() {
     }
   }, [targetLanguage]);
 
-  // 🔥 QUAN TRỌNG: Translation với Sequential và Debounce để tránh rate limit
+  // Translation useEffect
   useEffect(() => {
-    let isCancelled = false;
-    let timeoutId: NodeJS.Timeout;
+    // Không dịch nếu targetLanguage trùng với SOURCE_LANGUAGE
+    if (targetLanguage === SOURCE_LANGUAGE) {
+      console.log("📄 [TRANSLATE] targetLanguage same as source, skipping translation");
+      return;
+    }
+    
+    if (transcripts.length === 0) {
+      return;
+    }
 
-    const translateAllSegments = async () => {
-      // Không dịch nếu không có transcript hoặc đang dịch
-      if (transcripts.length === 0 || isTranslating) {
-        return;
-      }
-
-      // Tìm các segment chưa được dịch
-      const toTranslate = transcripts.filter(
-        t => !translatedSegments.find(s => s.timestamp === t.timestamp)
-      );
-
-      if (toTranslate.length === 0) {
-        return;
-      }
-
-      console.log(`🌐 Starting sequential translation for ${toTranslate.length} segments`);
+    const translateAll = async () => {
+      const existingTimestamps = new Set(translatedSegments.map(s => s.timestamp));
+      const toTranslate = transcripts.filter(t => !existingTimestamps.has(t.timestamp));
+      
+      if (toTranslate.length === 0) return;
+      
+      console.log(`🌐 [TRANSLATE] Translating ${toTranslate.length} segments from ${SOURCE_LANGUAGE} to ${targetLanguage}`);
       setIsTranslating(true);
-
-      // 🔥 DỊCH TUẦN TỰ (SEQUENTIAL) thay vì Promise.all
+      
       for (let i = 0; i < toTranslate.length; i++) {
         const t = toTranslate[i];
         
-        // Thoát nếu component unmount
-        if (isCancelled) break;
-
-        console.log(`🔄 Translating segment ${i + 1}/${toTranslate.length}: "${t.text.substring(0, 50)}..."`);
+        const result = await translateSegment(t.text, t.timestamp, t.t0, t.t1, t.speaker);
         
-        const result = await translateWithRetry(t.text, t.timestamp, t.t0, t.t1, t.speaker);
-        
-        if (result && !isCancelled) {
-          // Cập nhật ngay kết quả của từng câu lên giao diện
+        if (result) {
           setTranslatedSegments(prev => {
             if (prev.some(s => s.timestamp === result.timestamp)) return prev;
-            const newSegments = [...prev, result].sort((a, b) => a.t0 - b.t0);
-            console.log(`✅ Translation completed for timestamp ${result.timestamp}`);
-            return newSegments;
+            return [...prev, result].sort((a, b) => a.t0 - b.t0);
           });
         }
-
-        // 🔥 THROTTLE: Nghỉ 1 giây giữa các request để tránh rate limit
-        // Groq API free tier: ~1000 requests/phút, với 1 request/giây là an toàn
-        if (i < toTranslate.length - 1 && !isCancelled) {
-          await new Promise(resolve => setTimeout(resolve, 1000));
+        
+        // Nghỉ giữa các request để tránh rate limit
+        if (i < toTranslate.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, 500));
         }
       }
-
-      if (!isCancelled) {
-        console.log(`🏁 Sequential translation completed for ${toTranslate.length} segments`);
-        setIsTranslating(false);
-      }
+      
+      setIsTranslating(false);
     };
-
-    // 🔥 DEBOUNCE: Chờ 1.5 giây sau khi có transcript mới bắt đầu dịch
-    // Giúp gom các câu lắt nhắt lại, tránh gọi API liên tục khi user đang nói
-    timeoutId = setTimeout(() => {
-      translateAllSegments();
-    }, 1500);
-
-    // Cleanup
-    return () => {
-      isCancelled = true;
-      clearTimeout(timeoutId);
-    };
-  }, [transcripts, targetLanguage, translateWithRetry, isTranslating, translatedSegments]);
+    
+    const timer = setTimeout(translateAll, 1000);
+    return () => clearTimeout(timer);
+  }, [transcripts, targetLanguage, translateSegment, translatedSegments.length]);
 
   // Diarization
   const runDiarization = useCallback(async (audioFilePath: string) => {
@@ -404,6 +398,54 @@ export default function Home() {
     }
   };
 
+  // Hàm Parser: Nhào nặn dữ liệu từ aiSummary sang chuẩn của EmailAgent
+  const prepareDataForEmailAgent = useCallback(() => {
+    if (!aiSummary) return { meetingContext: "", userTasks: [] };
+
+    const individualTasks = (aiSummary as any).individual_tasks || (aiSummary as any).IndividualTasks;
+    
+    if (!individualTasks?.blocks || individualTasks.blocks.length === 0) {
+      return { meetingContext: "", userTasks: [] };
+    }
+
+    const meetingContext = [
+      (aiSummary as any).SectionSummary?.blocks?.map((b: any) => b.content).join(" ") || "",
+      (aiSummary as any).KeyItemsDecisions?.blocks?.map((b: any) => b.content).join(" ") || "",
+      (aiSummary as any).key_points?.blocks?.map((b: any) => b.content).join(" ") || "",
+      (aiSummary as any).decisions?.blocks?.map((b: any) => b.content).join(" ") || "",
+    ].filter(Boolean).join("\n\n");
+
+    const userTasksMap = new Map();
+
+    individualTasks.blocks.forEach((block: any) => {
+      const text = block.content || block.title || "";
+      const match = text.match(/^\[(.*?)\]:\s*(.*?)(?:\s*\((?:Deadline:\s*)?(.*?)\))?$/i);
+      
+      if (match) {
+        const name = match[1].trim();
+        const task_name = match[2].trim();
+        const deadline = match[3] ? match[3].replace(')', '').trim() : "ASAP";
+
+        if (!userTasksMap.has(name)) {
+          let email = `${name.toLowerCase().replace(/\s+/g, '.')}@company.com`;
+          const speakerMap = speakerMaps.find(s => s.name === name || s.speaker_id === name);
+          if (speakerMap?.email) {
+            email = speakerMap.email;
+          }
+          
+          userTasksMap.set(name, {
+            name: name,
+            email: email,
+            tasks: []
+          });
+        }
+        userTasksMap.get(name).tasks.push({ task_name, deadline });
+      }
+    });
+
+    return { meetingContext, userTasks: Array.from(userTasksMap.values()) };
+  }, [aiSummary, speakerMaps]);
+
   // AI Summary
   const generateAISummary = useCallback(async () => {
     setSummaryStatus('processing');
@@ -427,7 +469,7 @@ export default function Home() {
           text: fullTranscript,
           model: modelConfig.provider,
           model_name: modelConfig.model,
-          chunk_size: 40000,
+          chunk_size: 20000,
           overlap: 1000
         })
       });
@@ -485,7 +527,7 @@ export default function Home() {
           text: originalTranscript,
           model: modelConfig.provider,
           model_name: modelConfig.model,
-          chunk_size: 40000,
+          chunk_size: 20000,
           overlap: 1000,
           force_regenerate: true
         })
@@ -686,9 +728,35 @@ export default function Home() {
 
   const isSummaryLoading = summaryStatus === 'processing' || summaryStatus === 'summarizing' || summaryStatus === 'regenerating';
 
+  // Lấy dữ liệu cho EmailAgent
+  const { meetingContext, userTasks } = prepareDataForEmailAgent();
+
+  const reloadContext = async () => {
+    try {
+      const response = await fetch('http://localhost:5167/company-context');
+      const data = await response.json();
+      if (data.success && data.content) {
+        setCompanyContext(data.content);
+        console.log("✅ Đã reload context từ Backend API");
+      }
+    } catch (err) {
+      console.error('Lỗi reload context:', err);
+    }
+  };
+
   // Render
   return (
     <div className="flex flex-col h-screen bg-gray-50">
+      {/* Nút cấu hình công ty ở góc trên cùng */}
+      <div className="fixed top-4 right-4 z-50">
+        <button
+          onClick={() => setShowContextModal(true)}
+          className="px-3 py-2 text-sm bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition shadow-lg flex items-center gap-2"
+        >
+          🏢 Cấu hình công ty
+        </button>
+      </div>
+
       <div className="flex flex-1 overflow-hidden">
         {/* Left side - Transcript */}
         <div className="w-1/3 min-w-[300px] border-r border-gray-200 bg-white flex flex-col relative">
@@ -785,7 +853,7 @@ export default function Home() {
           />
         </div>
 
-        {/* Right side - AI Summary */}
+        {/* Right side - AI Summary & Email Agent */}
         <div className="flex-1 overflow-y-auto bg-white">
           {isSummaryLoading ? (
             <div className="flex items-center justify-center h-full">
@@ -796,7 +864,7 @@ export default function Home() {
             </div>
           ) : showSummary && (
             <div className="max-w-4xl mx-auto p-6">
-              <div className="flex-1 overflow-y-auto p-4">
+              <div className="flex-1 overflow-y-auto">
                 <AISummary 
                   summary={aiSummary} 
                   status={summaryStatus} 
@@ -804,7 +872,19 @@ export default function Home() {
                   onSummaryChange={(newSummary) => setAiSummary(newSummary)}
                   onRegenerateSummary={handleRegenerateSummary}
                 />
+
+                {/* PHẦN HIỂN THỊ EMAIL AGENT */}
+                {summaryStatus === 'completed' && userTasks.length > 0 && (
+                  <div className="mt-8 border-t border-gray-200 pt-6">
+                    <EmailAgent 
+                      meetingSummary={meetingContext}
+                      tasks={userTasks}
+                      contextFileText={companyContext}
+                    />
+                  </div>
+                )}
               </div>
+
               {summaryStatus !== 'idle' && (
                 <div className={`mt-4 p-4 rounded-lg ${
                   summaryStatus === 'error' ? 'bg-red-100 text-red-700' :
@@ -818,6 +898,29 @@ export default function Home() {
           )}
         </div>
       </div>
+
+      {/* Modal cấu hình công ty */}
+      {showContextModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-lg p-6 max-w-2xl w-full max-h-[80vh] overflow-y-auto">
+            <div className="flex justify-between items-center mb-4">
+              <h2 className="text-xl font-bold">🏢 Cấu hình thông tin công ty</h2>
+              <button
+                onClick={() => setShowContextModal(false)}
+                className="text-gray-500 hover:text-gray-700 text-2xl"
+              >
+                ✕
+              </button>
+            </div>
+            <CompanyContextManager 
+              onClose={() => {
+                setShowContextModal(false);
+                reloadContext();
+              }}
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 }

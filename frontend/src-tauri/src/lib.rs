@@ -1,26 +1,27 @@
-use std::fs;
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
-use std::time::Duration;
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
+use std::time::Duration;
 
 // Declare audio module
 pub mod audio;
 pub mod ollama;
 
-use audio::{
-    default_input_device, default_output_device, AudioStream,
-};
-use tauri::{Runtime, AppHandle, Emitter};
-use log::{info as log_info, error as log_error, debug as log_debug};
+use audio::{default_input_device, default_output_device, AudioStream};
+use log::{debug as log_debug, error as log_error, info as log_info};
 use reqwest::multipart::{Form, Part};
+use tauri::{AppHandle, Emitter, Runtime};
 
 // Audio configuration constants - ĐÃ TỐI ƯU CHO REAL-TIME
-const CHUNK_DURATION_MS: u32 = 3000;      // 3 giây
-const CHUNK_OVERLAP_MS: u32 = 500;        // Overlap 0.5s để không mất chữ ở ranh giới
+const CHUNK_DURATION_MS: u32 = 3000; // 3 giây
+const CHUNK_OVERLAP_MS: u32 = 500; // Overlap 0.5s để không mất chữ ở ranh giới
 const WHISPER_SAMPLE_RATE: u32 = 16000;
 const WAV_SAMPLE_RATE: u32 = 44100;
 const SENTENCE_TIMEOUT_MS: u64 = 800;
-const MIN_CHUNK_DURATION_MS: u32 = 1000;  // 1 giây là có thể gửi nếu có khoảng lặng
+const MIN_CHUNK_DURATION_MS: u32 = 1000; // 1 giây là có thể gửi nếu có khoảng lặng
 const MIN_RECORDING_DURATION_MS: u64 = 2000;
 // 🔥 QUAN TRỌNG: ĐÃ TĂNG TỪ 0.005 LÊN 0.05 ĐỂ LỌC NHIỄU
 const VOICE_ACTIVITY_THRESHOLD: f32 = 0.05;
@@ -94,9 +95,17 @@ impl TranscriptAccumulator {
         }
         let lower_text = text.to_lowercase();
         let sentence_starters = [
-            " and ", " but ", " so ", " then ", " however ", 
-            " therefore ", " consequently ", " additionally ",
-            " furthermore ", " moreover ", " nevertheless "
+            " and ",
+            " but ",
+            " so ",
+            " then ",
+            " however ",
+            " therefore ",
+            " consequently ",
+            " additionally ",
+            " furthermore ",
+            " moreover ",
+            " nevertheless ",
         ];
         for starter in sentence_starters {
             if lower_text.starts_with(starter) && !self.current_sentence.is_empty() {
@@ -112,7 +121,8 @@ impl TranscriptAccumulator {
     fn add_segment(&mut self, segment: &TranscriptSegment) -> Option<TranscriptUpdate> {
         log_debug!("Processing new transcript segment: {:?}", segment);
         self.last_update_time = std::time::Instant::now();
-        let clean_text = segment.text
+        let clean_text = segment
+            .text
             .replace("[BLANK_AUDIO]", "")
             .replace("[AUDIO OUT]", "")
             .replace("  ", " ")
@@ -166,8 +176,9 @@ impl TranscriptAccumulator {
     }
 
     fn check_timeout(&mut self) -> Option<TranscriptUpdate> {
-        if !self.current_sentence.is_empty() && 
-           self.last_update_time.elapsed() > Duration::from_millis(SENTENCE_TIMEOUT_MS) {
+        if !self.current_sentence.is_empty()
+            && self.last_update_time.elapsed() > Duration::from_millis(SENTENCE_TIMEOUT_MS)
+        {
             let sentence = std::mem::take(&mut self.current_sentence);
             let current_time = self.sentence_start_time + (SENTENCE_TIMEOUT_MS as f32 / 1000.0);
             self.seq_counter += 1;
@@ -180,7 +191,10 @@ impl TranscriptAccumulator {
                     t1: current_time,
                     seq: self.seq_counter,
                 };
-                log_debug!("Timeout - emitting incomplete sentence: seq={}", self.seq_counter);
+                log_debug!(
+                    "Timeout - emitting incomplete sentence: seq={}",
+                    self.seq_counter
+                );
                 return Some(update);
             }
         }
@@ -223,9 +237,13 @@ fn resample_audio(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     resampled
 }
 
-async fn send_audio_chunk(chunk: Vec<f32>, client: &reqwest::Client) -> Result<TranscriptResponse, String> {
+async fn send_audio_chunk(
+    chunk: Vec<f32>,
+    client: &reqwest::Client,
+) -> Result<TranscriptResponse, String> {
     log_debug!("Preparing to send audio chunk of size: {}", chunk.len());
-    let bytes: Vec<u8> = chunk.iter()
+    let bytes: Vec<u8> = chunk
+        .iter()
         .flat_map(|&sample| {
             let clamped = sample.max(-1.0).min(1.0);
             clamped.to_le_bytes().to_vec()
@@ -237,8 +255,12 @@ async fn send_audio_chunk(chunk: Vec<f32>, client: &reqwest::Client) -> Result<T
     while retry_count <= max_retries {
         if retry_count > 0 {
             let delay = Duration::from_millis(100 * (2_u64.pow(retry_count as u32)));
-            log::info!("Retry attempt {} of {}. Waiting {:?} before retry...", 
-                      retry_count, max_retries, delay);
+            log::info!(
+                "Retry attempt {} of {}. Waiting {:?} before retry...",
+                retry_count,
+                max_retries,
+                delay
+            );
             tokio::time::sleep(delay).await;
         }
         let part = Part::bytes(bytes.clone())
@@ -246,28 +268,31 @@ async fn send_audio_chunk(chunk: Vec<f32>, client: &reqwest::Client) -> Result<T
             .mime_str("audio/x-raw")
             .unwrap();
         let form = Form::new().part("audio", part);
-        match client.post("http://127.0.0.1:8178/stream")
-            .timeout(Duration::from_secs(10)) // 🔥 THÊM TIMEOUT 10s
+        match client
+            .post("http://127.0.0.1:8178/stream")
+            .timeout(Duration::from_secs(20)) // 🔥 THÊM TIMEOUT 10s
             .multipart(form)
             .send()
-            .await {
-                Ok(response) => {
-                    match response.json::<TranscriptResponse>().await {
-                        Ok(transcript) => return Ok(transcript),
-                        Err(e) => {
-                            last_error = e.to_string();
-                            log::error!("Failed to parse response: {}", last_error);
-                        }
-                    }
-                }
+            .await
+        {
+            Ok(response) => match response.json::<TranscriptResponse>().await {
+                Ok(transcript) => return Ok(transcript),
                 Err(e) => {
                     last_error = e.to_string();
-                    log::error!("Request failed: {}", last_error);
+                    log::error!("Failed to parse response: {}", last_error);
                 }
+            },
+            Err(e) => {
+                last_error = e.to_string();
+                log::error!("Request failed: {}", last_error);
             }
+        }
         retry_count += 1;
     }
-    Err(format!("Failed after {} retries. Last error: {}", max_retries, last_error))
+    Err(format!(
+        "Failed after {} retries. Last error: {}",
+        max_retries, last_error
+    ))
 }
 
 #[tauri::command]
@@ -279,11 +304,11 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     }
     RECORDING_FLAG.store(true, Ordering::SeqCst);
     log_info!("Recording flag set to true");
-    
+
     *RECORDING_START_TIME.lock().unwrap() = Some(std::time::Instant::now());
     *MIC_BUFFER.lock().unwrap() = Some(Arc::new(Mutex::new(Vec::new())));
     *SYSTEM_BUFFER.lock().unwrap() = Some(Arc::new(Mutex::new(Vec::new())));
-    
+
     let mic_device = Arc::new(default_input_device().map_err(|e| {
         log_error!("Failed to get default input device: {}", e);
         e.to_string()
@@ -307,11 +332,11 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
             e.to_string()
         })?;
     let system_stream = Arc::new(system_stream);
-    
+
     *MIC_STREAM.lock().unwrap() = Some(mic_stream.clone());
     *SYSTEM_STREAM.lock().unwrap() = Some(system_stream.clone());
     *IS_RUNNING_FLAG.lock().unwrap() = Some(is_running.clone());
-    
+
     let client = reqwest::Client::new();
     let app_handle = app.clone();
     let mic_receiver = mic_stream.subscribe().await;
@@ -328,16 +353,19 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     let device_config = mic_stream.device_config.clone();
     let sample_rate = device_config.sample_rate().0;
     let channels = device_config.channels();
-    
+
     tokio::spawn(async move {
-        let chunk_samples = (WHISPER_SAMPLE_RATE as f32 * (CHUNK_DURATION_MS as f32 / 1000.0)) as usize;
-        let overlap_samples = (WHISPER_SAMPLE_RATE as f32 * (CHUNK_OVERLAP_MS as f32 / 1000.0)) as usize;
-        let min_samples = (WHISPER_SAMPLE_RATE as f32 * (MIN_CHUNK_DURATION_MS as f32 / 1000.0)) as usize;
+        let chunk_samples =
+            (WHISPER_SAMPLE_RATE as f32 * (CHUNK_DURATION_MS as f32 / 1000.0)) as usize;
+        let overlap_samples =
+            (WHISPER_SAMPLE_RATE as f32 * (CHUNK_OVERLAP_MS as f32 / 1000.0)) as usize;
+        let min_samples =
+            (WHISPER_SAMPLE_RATE as f32 * (MIN_CHUNK_DURATION_MS as f32 / 1000.0)) as usize;
         let mut current_chunk: Vec<f32> = Vec::with_capacity(chunk_samples);
         let mut last_chunk_tail: Vec<f32> = Vec::new();
         let mut last_chunk_time = std::time::Instant::now();
         log_info!("Mic config: {} Hz, {} channels", sample_rate, channels);
-        
+
         while is_running.load(Ordering::SeqCst) {
             if let Some(update) = accumulator.check_timeout() {
                 if let Err(e) = app_handle.emit("transcript-update", update) {
@@ -347,7 +375,7 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
             let mut new_samples = Vec::new();
             let mut mic_samples = Vec::new();
             let mut system_samples = Vec::new();
-            
+
             while let Ok(chunk) = mic_receiver_clone.try_recv() {
                 let chunk_clone = chunk.clone();
                 mic_samples.extend(chunk);
@@ -368,8 +396,16 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
             }
             let max_len = mic_samples.len().max(system_samples.len());
             for i in 0..max_len {
-                let mic_sample = if i < mic_samples.len() { mic_samples[i] } else { 0.0 };
-                let system_sample = if i < system_samples.len() { system_samples[i] } else { 0.0 };
+                let mic_sample = if i < mic_samples.len() {
+                    mic_samples[i]
+                } else {
+                    0.0
+                };
+                let system_sample = if i < system_samples.len() {
+                    system_samples[i]
+                } else {
+                    0.0
+                };
                 let mixed = (mic_sample * 1.2) + (system_sample * 0.7);
                 new_samples.push(mixed.clamp(-1.0, 1.0));
             }
@@ -383,16 +419,16 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
             for sample in samples_to_process {
                 current_chunk.push(sample);
             }
-            
+
             let time_elapsed = last_chunk_time.elapsed();
-            let should_send = (current_chunk.len() >= chunk_samples) ||
-                            (current_chunk.len() >= min_samples && 
-                             time_elapsed >= Duration::from_millis(CHUNK_DURATION_MS as u64));
-            
+            let should_send = (current_chunk.len() >= chunk_samples)
+                || (current_chunk.len() >= min_samples
+                    && time_elapsed >= Duration::from_millis(CHUNK_DURATION_MS as u64));
+
             if should_send {
                 let chunk_to_send = current_chunk.clone();
                 let chunk_duration_secs = chunk_to_send.len() as f32 / sample_rate as f32;
-                
+
                 let has_voice = has_voice_activity(&chunk_to_send, VOICE_ACTIVITY_THRESHOLD);
                 if !has_voice {
                     println!("🔇 [RUST] Skipping silent chunk (no voice activity detected)");
@@ -401,9 +437,10 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
                     last_chunk_time = std::time::Instant::now();
                     continue;
                 }
-                
+
                 if chunk_to_send.len() > overlap_samples {
-                    last_chunk_tail = chunk_to_send[chunk_to_send.len() - overlap_samples..].to_vec();
+                    last_chunk_tail =
+                        chunk_to_send[chunk_to_send.len() - overlap_samples..].to_vec();
                 } else {
                     last_chunk_tail = chunk_to_send.clone();
                 }
@@ -411,20 +448,26 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
                 last_chunk_time = std::time::Instant::now();
                 let chunk_num = chunk_counter_clone.fetch_add(1, Ordering::SeqCst);
                 log_info!("Processing chunk {}", chunk_num);
-                
+
                 let whisper_samples = if sample_rate != WHISPER_SAMPLE_RATE {
                     resample_audio(&chunk_to_send, sample_rate, WHISPER_SAMPLE_RATE)
                 } else {
                     chunk_to_send
                 };
-                
-                println!("🎙️ [RUST] Sending chunk {}: {} samples ({:.1}s)", 
-                         chunk_num, whisper_samples.len(),
-                         whisper_samples.len() as f32 / WHISPER_SAMPLE_RATE as f32);
-                
+
+                println!(
+                    "🎙️ [RUST] Sending chunk {}: {} samples ({:.1}s)",
+                    chunk_num,
+                    whisper_samples.len(),
+                    whisper_samples.len() as f32 / WHISPER_SAMPLE_RATE as f32
+                );
+
                 match send_audio_chunk(whisper_samples, &client).await {
                     Ok(response) => {
-                        println!("✅ [RUST] Whisper response: {} segments", response.segments.len());
+                        println!(
+                            "✅ [RUST] Whisper response: {} segments",
+                            response.segments.len()
+                        );
                         for segment in response.segments {
                             let adjusted_t0 = segment.t0 + cumulative_seconds;
                             let adjusted_t1 = segment.t1 + cumulative_seconds;
@@ -440,8 +483,10 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
                             }
                         }
                         cumulative_seconds += chunk_duration_secs;
-                        println!("⏱️ [RUST] cumulative_seconds updated: {:.1}s (+{:.1}s)", 
-                                 cumulative_seconds, chunk_duration_secs);
+                        println!(
+                            "⏱️ [RUST] cumulative_seconds updated: {:.1}s (+{:.1}s)",
+                            cumulative_seconds, chunk_duration_secs
+                        );
                     }
                     Err(e) => {
                         log_error!("Transcription error: {}", e);
@@ -464,58 +509,73 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
 #[tauri::command]
 async fn stop_recording(save_path: String) -> Result<(), String> {
     log_info!("Attempting to stop recording...");
-    
+
     if !RECORDING_FLAG.load(Ordering::SeqCst) {
         log_info!("Recording is already stopped");
         return Ok(());
     }
 
-    let elapsed_ms = RECORDING_START_TIME.lock().unwrap()
+    let elapsed_ms = RECORDING_START_TIME
+        .lock()
+        .unwrap()
         .map(|start| start.elapsed().as_millis() as u64)
         .unwrap_or(0);
 
     if elapsed_ms < MIN_RECORDING_DURATION_MS {
         let remaining = MIN_RECORDING_DURATION_MS - elapsed_ms;
-        log_info!("Waiting for minimum recording duration ({} ms remaining)...", remaining);
+        log_info!(
+            "Waiting for minimum recording duration ({} ms remaining)...",
+            remaining
+        );
         tokio::time::sleep(Duration::from_millis(remaining)).await;
     }
 
     RECORDING_FLAG.store(false, Ordering::SeqCst);
     log_info!("Recording flag set to false");
-    
+
     let is_running_opt = IS_RUNNING_FLAG.lock().unwrap().take();
     if let Some(is_running) = is_running_opt {
         is_running.store(false, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(100)).await;
-        
+
         let mic_stream_opt = MIC_STREAM.lock().unwrap().take();
         if let Some(mic_stream) = mic_stream_opt {
             log_info!("Stopping microphone stream...");
             let _ = mic_stream.stop().await;
         }
-        
+
         let system_stream_opt = SYSTEM_STREAM.lock().unwrap().take();
         if let Some(system_stream) = system_stream_opt {
             log_info!("Stopping system stream...");
             let _ = system_stream.stop().await;
         }
-        
+
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    
-    let mic_data = MIC_BUFFER.lock().unwrap().take()
+
+    let mic_data = MIC_BUFFER
+        .lock()
+        .unwrap()
+        .take()
         .and_then(|b| b.lock().ok().map(|g| g.clone()))
         .unwrap_or_default();
-    let system_data = SYSTEM_BUFFER.lock().unwrap().take()
+    let system_data = SYSTEM_BUFFER
+        .lock()
+        .unwrap()
+        .take()
         .and_then(|b| b.lock().ok().map(|g| g.clone()))
         .unwrap_or_default();
-    
+
     let max_len = mic_data.len().max(system_data.len());
     let mut mixed_data = Vec::with_capacity(max_len);
-    
+
     for i in 0..max_len {
         let mic_sample = if i < mic_data.len() { mic_data[i] } else { 0.0 };
-        let system_sample = if i < system_data.len() { system_data[i] } else { 0.0 };
+        let system_sample = if i < system_data.len() {
+            system_data[i]
+        } else {
+            0.0
+        };
         let mixed = (mic_sample * 1.2) + (system_sample * 0.7);
         mixed_data.push(mixed.clamp(-1.0, 1.0));
     }
@@ -524,15 +584,15 @@ async fn stop_recording(save_path: String) -> Result<(), String> {
         log_error!("No audio data captured");
         return Err("No audio data captured".to_string());
     }
-    
+
     log_info!("Mixed {} audio samples", mixed_data.len());
-    
+
     let mut bytes = Vec::with_capacity(mixed_data.len() * 2);
     for &sample in mixed_data.iter() {
         let value = (sample.max(-1.0).min(1.0) * 32767.0) as i16;
         bytes.extend_from_slice(&value.to_le_bytes());
     }
-    
+
     log_info!("Converted to {} bytes of PCM data", bytes.len());
 
     let data_size = bytes.len() as u32;
@@ -542,9 +602,9 @@ async fn stop_recording(save_path: String) -> Result<(), String> {
     let block_align = channels * (bits_per_sample / 8);
     let byte_rate = sample_rate * block_align as u32;
     let file_size = 36 + data_size;
-    
+
     let mut wav_file = Vec::with_capacity(44 + bytes.len());
-    
+
     wav_file.extend_from_slice(b"RIFF");
     wav_file.extend_from_slice(&file_size.to_le_bytes());
     wav_file.extend_from_slice(b"WAVE");
@@ -559,9 +619,13 @@ async fn stop_recording(save_path: String) -> Result<(), String> {
     wav_file.extend_from_slice(b"data");
     wav_file.extend_from_slice(&data_size.to_le_bytes());
     wav_file.extend_from_slice(&bytes);
-    
-    log_info!("💾 Saving file to: {} ({} bytes)", save_path, wav_file.len());
-    
+
+    log_info!(
+        "💾 Saving file to: {} ({} bytes)",
+        save_path,
+        wav_file.len()
+    );
+
     if let Some(parent) = std::path::Path::new(&save_path).parent() {
         if !parent.exists() {
             log_info!("Creating directory: {:?}", parent);
@@ -582,7 +646,7 @@ async fn stop_recording(save_path: String) -> Result<(), String> {
             return Err(err_msg);
         }
     }
-    
+
     Ok(())
 }
 
@@ -595,7 +659,7 @@ fn is_recording() -> bool {
 fn read_audio_file(file_path: String) -> Result<Vec<u8>, String> {
     match std::fs::read(&file_path) {
         Ok(data) => Ok(data),
-        Err(e) => Err(format!("Failed to read audio file: {}", e))
+        Err(e) => Err(format!("Failed to read audio file: {}", e)),
     }
 }
 
@@ -617,6 +681,7 @@ async fn save_transcript(file_path: String, content: String) -> Result<(), Strin
 pub fn run() {
     log::set_max_level(log::LevelFilter::Info);
     tauri::Builder::default()
+        .plugin(tauri_plugin_fs::init())
         .setup(|_app| {
             log::info!("Application setup complete");
             Ok(())

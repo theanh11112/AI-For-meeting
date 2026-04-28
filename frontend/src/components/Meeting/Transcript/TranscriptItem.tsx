@@ -20,7 +20,7 @@ export const TranscriptItem: React.FC<TranscriptItemProps> = ({
   const speakerColor = getSpeakerColor(item.speaker || '');
 
   return (
-    <div className="relative group">
+    <div className="relative group transition-colors duration-200 hover:bg-gray-50 rounded-lg p-1 -mx-1">
       <div className="flex items-start gap-2">
         <span className="text-[10px] font-mono text-gray-400 whitespace-nowrap mt-0.5">
           {formatTimeFromSeconds(item.t0)}
@@ -45,19 +45,18 @@ export const TranscriptItem: React.FC<TranscriptItemProps> = ({
               )}
             </div>
             
-            <p className={`text-sm leading-relaxed p-1 -m-1 rounded transition-all duration-500 ${
+            <p className={`text-sm leading-relaxed transition-all duration-500 ${
               item.isVerified ? 'text-gray-900' : 'text-gray-500 italic'
             }`}>
               {item.text}
             </p>
             
+            {/* PHẦN DỊCH - HIỂN THỊ NGAY BÊN DƯỚI, CÓ HIỆU ỨNG HOVER MƯỢT */}
             {translatedText && translatedText !== '[Translation failed]' && (
-              <div className="overflow-hidden transition-all duration-200 max-h-0 group-hover:max-h-24 group-hover:mt-2">
-                <div className="pt-1">
-                  <p className="text-sm text-blue-600 leading-relaxed border-l-2 border-blue-300 pl-2">
-                    {translatedText}
-                  </p>
-                </div>
+              <div className="overflow-hidden transition-all duration-300 max-h-0 group-hover:max-h-32 group-hover:mt-2">
+                <p className="text-sm text-green-600 leading-relaxed border-l-2 border-green-400 pl-2 py-0.5 italic">
+                  {translatedText}
+                </p>
               </div>
             )}
           </div>

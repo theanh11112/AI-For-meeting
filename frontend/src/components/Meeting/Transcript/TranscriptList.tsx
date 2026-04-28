@@ -77,7 +77,10 @@ export const TranscriptList: React.FC<TranscriptListProps> = ({
         {[...transcripts]
           .sort((a, b) => a.t0 - b.t0)
           .map((item) => {
-            const translatedItem = translatedSegments.find(s => s.timestamp === item.timestamp);
+            // Tìm bản dịch bằng t0 với sai số 0.2 giây
+            const translatedItem = translatedSegments.find(
+              s => Math.abs(s.t0 - item.t0) < 0.2
+            );
             const displayName = getSpeakerDisplayName(item.speaker || 'UNKNOWN');
             
             return (

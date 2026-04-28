@@ -52,7 +52,6 @@ class SummaryResponse(BaseModel):
     NextSteps: Section
     OtherImportantPoints: Section
     ClosingRemarks: Section
-    # 🔥 THÊM TRƯỜNG INDIVIDUAL TASKS
     IndividualTasks: Section
 
 
@@ -551,7 +550,7 @@ class MeetingSummarizer:
         )
 
 
-# 🔥 UPDATED SYSTEM PROMPT với hướng dẫn về Individual Tasks
+# ==================== SYSTEM PROMPT TỐI ƯU CHO EMAIL AGENT ====================
 SYSTEM_PROMPT = """You are a professional meeting assistant. Your task is to extract information and organize it into sections.
 
 1. EXTRACT INFORMATION
@@ -569,12 +568,31 @@ After gathering information, organize it into:
 - Individual tasks assigned to specific people (use add_individual_task ONE at a time)
 - Any other important points
 
-3. SPECIAL INSTRUCTIONS FOR 'IndividualTasks' SECTION:
-- Identify specific tasks assigned to specific people
-- Use the speaker tags like [Người 00], [Người 01] or their real names to identify the assignee
-- Each block in this section should follow the format: "[Assignee Name]: [Task Description] (Deadline if mentioned)"
-- If a task is mentioned but no one is specifically assigned, put it in 'ImmediateActionItems' instead
-- If the transcript is just a conversation with no assignments, leave the blocks array empty []
+3. ⚠️ CRITICAL FORMAT FOR INDIVIDUAL TASKS ⚠️
+When using add_individual_task, you MUST format task with assignee as the person's name.
+
+The add_individual_task function will automatically format as: [Assignee Name]: Task description (Deadline: date)
+
+For example, if you call:
+add_individual_task(assignee="Anne", task="Learn more about offset printing", deadline="tomorrow")
+
+It will create: "[Anne]: Learn more about offset printing (Deadline: tomorrow)"
+
+RULES for assignee:
+- Use the person's real name if mentioned (Anne, John, Mr. Richardson)
+- Use speaker tags like "Người 01" if name is unknown
+- ALWAYS use add_individual_task for tasks with a specific assignee
+- NEVER put multiple tasks in one add_individual_task call
+
+RULES for deadline:
+- Extract deadline if mentioned in transcript
+- If deadline is mentioned like "ngày mai", "tomorrow", "next week", include it
+- If no deadline mentioned, leave deadline as None (it will show as "ASAP")
+
+RULES for task:
+- Be specific and concise
+- Capture the exact action item from the transcript
+- Start with a verb if possible
 
 4. SAVE AND FINALIZE
 - Use tools sequentially, waiting for each response
@@ -582,19 +600,19 @@ After gathering information, organize it into:
 - Finally call get_final_summary
 
 Available tools:
-- query_transcript
-- add_action_item
-- add_agenda_item
-- add_decision
-- add_individual_task (NEW: Use this for tasks assigned to specific people)
-- save_final_summary_result
-- get_final_summary
-- delete_processed_chunks
+- query_transcript - Query the ChromaDB for transcript chunks
+- add_action_item - Add a general action item
+- add_agenda_item - Add an agenda item
+- add_decision - Add a decision made in the meeting
+- add_individual_task - ADD TASKS FOR SPECIFIC PEOPLE (USE THIS!)
+- save_final_summary_result - Save summary to file
+- get_final_summary - Get the complete summary
+- delete_processed_chunks - Clean up processed chunks
 
 The transcript is stored in ChromaDB - use query_transcript to access it.
 Remember to make only ONE tool call at a time and wait for its response.
 If you get CHROMADB_EMPTY: All chunks have been processed,
-please save the summary to a file and end the process by calling final_result.
+please save the summary to a file and end the process by calling get_final_summary.
 
 Do not run after CHROMADB_EMPTY is received.
 """
