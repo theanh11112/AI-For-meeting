@@ -15,17 +15,26 @@ use log::{debug as log_debug, error as log_error, info as log_info};
 use reqwest::multipart::{Form, Part};
 use tauri::{AppHandle, Emitter, Runtime};
 
-// Audio configuration constants - ĐÃ TỐI ƯU CHO REAL-TIME
+// Audio configuration constants
 const CHUNK_DURATION_MS: u32 = 3000; // 3 giây
-const CHUNK_OVERLAP_MS: u32 = 500; // Overlap 0.5s để không mất chữ ở ranh giới
+const CHUNK_OVERLAP_MS: u32 = 500; // Overlap 0.5s
 const WHISPER_SAMPLE_RATE: u32 = 16000;
 const WAV_SAMPLE_RATE: u32 = 44100;
 const SENTENCE_TIMEOUT_MS: u64 = 800;
-const MIN_CHUNK_DURATION_MS: u32 = 1000; // 1 giây là có thể gửi nếu có khoảng lặng
+const MIN_CHUNK_DURATION_MS: u32 = 1500; // 1.5 giây - KHÔNG GỬI CHUNK NGẮN HƠN
 const MIN_RECORDING_DURATION_MS: u64 = 2000;
-// 🔥 QUAN TRỌNG: ĐÃ TĂNG TỪ 0.005 LÊN 0.05 ĐỂ LỌC NHIỄU
-const VOICE_ACTIVITY_THRESHOLD: f32 = 0.05;
+
+// VAD threshold - đã tối ưu
+const VOICE_ACTIVITY_THRESHOLD: f32 = 0.012;
 const MAX_SENTENCE_LENGTH: usize = 200;
+
+// Tỷ lệ mix audio
+const MIC_VOLUME: f32 = 1.2;
+const SYSTEM_VOLUME: f32 = 0.35;
+
+// Force send parameters
+const FORCE_SEND_INTERVAL: usize = 10;
+const MAX_SILENT_CHUNKS: usize = 5;
 
 // Global state
 static RECORDING_FLAG: AtomicBool = AtomicBool::new(false);
@@ -95,17 +104,9 @@ impl TranscriptAccumulator {
         }
         let lower_text = text.to_lowercase();
         let sentence_starters = [
-            " and ",
-            " but ",
-            " so ",
-            " then ",
-            " however ",
-            " therefore ",
-            " consequently ",
-            " additionally ",
-            " furthermore ",
-            " moreover ",
-            " nevertheless ",
+            " and ", " but ", " so ", " then ", " however ",
+            " therefore ", " consequently ", " additionally ",
+            " furthermore ", " moreover ", " nevertheless ",
         ];
         for starter in sentence_starters {
             if lower_text.starts_with(starter) && !self.current_sentence.is_empty() {
@@ -128,6 +129,16 @@ impl TranscriptAccumulator {
             .replace("  ", " ")
             .trim()
             .to_string();
+        
+        // Lọc bỏ hallucination patterns
+        if clean_text.contains("if-if-if") 
+            || clean_text.contains("thank you") && clean_text.len() < 20
+            || clean_text.contains("subtitles by")
+            || clean_text.chars().filter(|c| *c == '-').count() > 3 {
+            log_debug!("Skipping hallucination pattern: {}", clean_text);
+            return None;
+        }
+        
         let duration = segment.t1 - segment.t0;
         if clean_text.is_empty() || duration < 0.3 {
             return None;
@@ -191,10 +202,7 @@ impl TranscriptAccumulator {
                     t1: current_time,
                     seq: self.seq_counter,
                 };
-                log_debug!(
-                    "Timeout - emitting incomplete sentence: seq={}",
-                    self.seq_counter
-                );
+                log_debug!("Timeout - emitting incomplete sentence: seq={}", self.seq_counter);
                 return Some(update);
             }
         }
@@ -202,16 +210,58 @@ impl TranscriptAccumulator {
     }
 }
 
-fn has_voice_activity(samples: &[f32], threshold: f32) -> bool {
-    let window_size = (WHISPER_SAMPLE_RATE as f32 * 0.025) as usize;
+// 🔥 QUAN TRỌNG: Hàm VAD nhận thêm tham số sample_rate
+fn has_voice_activity(samples: &[f32], threshold: f32, sample_rate: u32) -> bool {
+    if samples.is_empty() {
+        return false;
+    }
+    
+    // Window 30ms dựa trên sample_rate thực tế
+    let window_size = (sample_rate as f32 * 0.030) as usize;
     let step = window_size / 2;
+    
     for chunk in samples.chunks(step) {
-        let max_amplitude = chunk.iter().fold(0.0f32, |max, &s| max.max(s.abs()));
-        if max_amplitude > threshold {
+        if chunk.len() < window_size / 3 {
+            continue;
+        }
+        
+        let mut sum_sq = 0.0f32;
+        let mut peak = 0.0f32;
+        
+        for &s in chunk {
+            sum_sq += s * s;
+            if s.abs() > peak {
+                peak = s.abs();
+            }
+        }
+        
+        let rms = (sum_sq / chunk.len() as f32).sqrt();
+        let energy = if rms > peak { rms } else { peak };
+        
+        if energy > threshold {
             return true;
         }
     }
     false
+}
+
+fn estimate_chunk_quality(samples: &[f32]) -> (f32, f32) {
+    if samples.is_empty() {
+        return (0.0, 0.0);
+    }
+    
+    let mut sum_sq = 0.0f32;
+    let mut peak = 0.0f32;
+    
+    for &s in samples {
+        sum_sq += s * s;
+        if s.abs() > peak {
+            peak = s.abs();
+        }
+    }
+    
+    let rms = (sum_sq / samples.len() as f32).sqrt();
+    (rms, peak)
 }
 
 fn resample_audio(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
@@ -242,6 +292,10 @@ async fn send_audio_chunk(
     client: &reqwest::Client,
 ) -> Result<TranscriptResponse, String> {
     log_debug!("Preparing to send audio chunk of size: {}", chunk.len());
+    
+    let (rms, peak) = estimate_chunk_quality(&chunk);
+    println!("📊 Chunk quality - RMS: {:.4}, Peak: {:.4}, Samples: {}", rms, peak, chunk.len());
+    
     let bytes: Vec<u8> = chunk
         .iter()
         .flat_map(|&sample| {
@@ -249,50 +303,57 @@ async fn send_audio_chunk(
             clamped.to_le_bytes().to_vec()
         })
         .collect();
-    let max_retries = 3;
+    
+    let max_retries = 2;
     let mut retry_count = 0;
     let mut last_error = String::new();
+    
     while retry_count <= max_retries {
         if retry_count > 0 {
-            let delay = Duration::from_millis(100 * (2_u64.pow(retry_count as u32)));
-            log::info!(
-                "Retry attempt {} of {}. Waiting {:?} before retry...",
-                retry_count,
-                max_retries,
-                delay
-            );
+            let delay = Duration::from_millis(500 * (retry_count as u64));
+            log::info!("Retry attempt {} of {}", retry_count, max_retries);
             tokio::time::sleep(delay).await;
         }
+        
         let part = Part::bytes(bytes.clone())
             .file_name("audio.raw")
             .mime_str("audio/x-raw")
             .unwrap();
         let form = Form::new().part("audio", part);
+        
         match client
             .post("http://127.0.0.1:8178/stream")
-            .timeout(Duration::from_secs(20)) // 🔥 THÊM TIMEOUT 10s
+            .timeout(Duration::from_secs(15))
             .multipart(form)
             .send()
             .await
         {
-            Ok(response) => match response.json::<TranscriptResponse>().await {
-                Ok(transcript) => return Ok(transcript),
-                Err(e) => {
-                    last_error = e.to_string();
-                    log::error!("Failed to parse response: {}", last_error);
+            Ok(response) => {
+                if response.status().is_success() {
+                    match response.json::<TranscriptResponse>().await {
+                        Ok(transcript) => {
+                            println!("✅ Whisper success: {} segments", transcript.segments.len());
+                            return Ok(transcript);
+                        },
+                        Err(e) => {
+                            last_error = format!("JSON parse error: {}", e);
+                            log::error!("{}", last_error);
+                        }
+                    }
+                } else {
+                    last_error = format!("HTTP error: {}", response.status());
+                    log::error!("{}", last_error);
                 }
             },
             Err(e) => {
-                last_error = e.to_string();
-                log::error!("Request failed: {}", last_error);
+                last_error = format!("Request failed: {}", e);
+                log::error!("{}", last_error);
             }
         }
         retry_count += 1;
     }
-    Err(format!(
-        "Failed after {} retries. Last error: {}",
-        max_retries, last_error
-    ))
+    
+    Err(format!("Failed after {} retries: {}", max_retries, last_error))
 }
 
 #[tauri::command]
@@ -342,29 +403,31 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     let mic_receiver = mic_stream.subscribe().await;
     let mut mic_receiver_clone = mic_receiver.resubscribe();
     let mut system_receiver = system_stream.subscribe().await;
-    let temp_dir = std::env::temp_dir();
-    let debug_dir = temp_dir.join("meeting_minutes_debug");
-    let _ = fs::create_dir_all(&debug_dir);
     let chunk_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let chunk_counter_clone = chunk_counter.clone();
     let mut accumulator = TranscriptAccumulator::new();
     let mut cumulative_seconds: f32 = 0.0;
-    println!("⏱️ [RUST] cumulative_seconds initialized to 0.0");
     let device_config = mic_stream.device_config.clone();
     let sample_rate = device_config.sample_rate().0;
     let channels = device_config.channels();
+    
+    println!("⏱️ [RUST] cumulative_seconds initialized to 0.0");
+    println!("🎙️ [RUST] Device sample rate: {} Hz", sample_rate);
 
     tokio::spawn(async move {
-        let chunk_samples =
-            (WHISPER_SAMPLE_RATE as f32 * (CHUNK_DURATION_MS as f32 / 1000.0)) as usize;
-        let overlap_samples =
-            (WHISPER_SAMPLE_RATE as f32 * (CHUNK_OVERLAP_MS as f32 / 1000.0)) as usize;
-        let min_samples =
-            (WHISPER_SAMPLE_RATE as f32 * (MIN_CHUNK_DURATION_MS as f32 / 1000.0)) as usize;
-        let mut current_chunk: Vec<f32> = Vec::with_capacity(chunk_samples);
+        // 🔥 QUAN TRỌNG: Dùng sample_rate thực tế để tính số samples
+        let target_samples = (sample_rate as f32 * (CHUNK_DURATION_MS as f32 / 1000.0)) as usize;
+        let overlap_samples = (sample_rate as f32 * (CHUNK_OVERLAP_MS as f32 / 1000.0)) as usize;
+        let min_samples = (sample_rate as f32 * (MIN_CHUNK_DURATION_MS as f32 / 1000.0)) as usize;
+        let mut current_chunk: Vec<f32> = Vec::with_capacity(target_samples);
         let mut last_chunk_tail: Vec<f32> = Vec::new();
         let mut last_chunk_time = std::time::Instant::now();
+        let mut silent_chunks_count = 0;
+        
         log_info!("Mic config: {} Hz, {} channels", sample_rate, channels);
+        log_info!("Chunk config: target={} samples ({}s), min={} samples ({}s)", 
+            target_samples, CHUNK_DURATION_MS as f32 / 1000.0,
+            min_samples, MIN_CHUNK_DURATION_MS as f32 / 1000.0);
 
         while is_running.load(Ordering::SeqCst) {
             if let Some(update) = accumulator.check_timeout() {
@@ -372,6 +435,7 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
                     log_error!("Failed to send timeout transcript update: {}", e);
                 }
             }
+            
             let mut new_samples = Vec::new();
             let mut mic_samples = Vec::new();
             let mut system_samples = Vec::new();
@@ -385,6 +449,7 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
                     }
                 }
             }
+            
             while let Ok(chunk) = system_receiver.try_recv() {
                 let chunk_clone = chunk.clone();
                 system_samples.extend(chunk);
@@ -394,21 +459,16 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
                     }
                 }
             }
+            
+            // Mix audio
             let max_len = mic_samples.len().max(system_samples.len());
             for i in 0..max_len {
-                let mic_sample = if i < mic_samples.len() {
-                    mic_samples[i]
-                } else {
-                    0.0
-                };
-                let system_sample = if i < system_samples.len() {
-                    system_samples[i]
-                } else {
-                    0.0
-                };
-                let mixed = (mic_sample * 1.2) + (system_sample * 0.7);
-                new_samples.push(mixed.clamp(-1.0, 1.0));
+                let mic_sample = if i < mic_samples.len() { mic_samples[i] } else { 0.0 };
+                let system_sample = if i < system_samples.len() { system_samples[i] } else { 0.0 };
+                let mixed = (mic_sample * MIC_VOLUME) + (system_sample * SYSTEM_VOLUME);
+                new_samples.push(mixed.tanh());
             }
+            
             let samples_to_process = if !last_chunk_tail.is_empty() {
                 let mut combined = last_chunk_tail.clone();
                 combined.extend(new_samples);
@@ -416,58 +476,90 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
             } else {
                 new_samples
             };
+            
             for sample in samples_to_process {
                 current_chunk.push(sample);
             }
 
             let time_elapsed = last_chunk_time.elapsed();
-            let should_send = (current_chunk.len() >= chunk_samples)
-                || (current_chunk.len() >= min_samples
-                    && time_elapsed >= Duration::from_millis(CHUNK_DURATION_MS as u64));
+            
+            let mut should_send = false;
+            
+            if current_chunk.len() >= target_samples {
+                should_send = true;
+            } else if current_chunk.len() >= min_samples 
+                && time_elapsed >= Duration::from_millis(CHUNK_DURATION_MS as u64) {
+                should_send = true;
+            }
+            
+            // KHÔNG BAO GIỜ GỬI CHUNK DƯỚI min_samples
+            if current_chunk.len() < min_samples {
+                should_send = false;
+            }
 
             if should_send {
                 let chunk_to_send = current_chunk.clone();
                 let chunk_duration_secs = chunk_to_send.len() as f32 / sample_rate as f32;
-
-                let has_voice = has_voice_activity(&chunk_to_send, VOICE_ACTIVITY_THRESHOLD);
-                if !has_voice {
-                    println!("🔇 [RUST] Skipping silent chunk (no voice activity detected)");
+                
+                // 🔥 Gọi VAD với sample_rate thực tế
+                let has_voice = if chunk_to_send.len() >= min_samples {
+                    has_voice_activity(&chunk_to_send, VOICE_ACTIVITY_THRESHOLD, sample_rate)
+                } else {
+                    false
+                };
+                
+                let chunk_num = chunk_counter_clone.fetch_add(1, Ordering::SeqCst);
+                let force_send = (chunk_num % FORCE_SEND_INTERVAL == 0) || (silent_chunks_count >= MAX_SILENT_CHUNKS);
+                
+                println!("📊 Chunk {}: {} samples ({:.2}s) [voice={}, force={}]", 
+                    chunk_num, chunk_to_send.len(), chunk_duration_secs,
+                    has_voice, force_send);
+                
+                if !has_voice && !force_send {
+                    silent_chunks_count += 1;
+                    println!("🔇 Silent chunk #{}, skipping", silent_chunks_count);
                     cumulative_seconds += chunk_duration_secs;
                     current_chunk.clear();
                     last_chunk_time = std::time::Instant::now();
                     continue;
                 }
-
+                
+                silent_chunks_count = 0;
+                
+                if has_voice {
+                    println!("🎤 Voice detected - sending chunk {}", chunk_num);
+                } else if force_send {
+                    println!("📢 Force send chunk {} (heartbeat)", chunk_num);
+                }
+                
+                // Lưu tail cho overlap
                 if chunk_to_send.len() > overlap_samples {
-                    last_chunk_tail =
-                        chunk_to_send[chunk_to_send.len() - overlap_samples..].to_vec();
+                    last_chunk_tail = chunk_to_send[chunk_to_send.len() - overlap_samples..].to_vec();
                 } else {
                     last_chunk_tail = chunk_to_send.clone();
                 }
+                
                 current_chunk.clear();
                 last_chunk_time = std::time::Instant::now();
-                let chunk_num = chunk_counter_clone.fetch_add(1, Ordering::SeqCst);
-                log_info!("Processing chunk {}", chunk_num);
-
+                
+                // Resample về sample rate của Whisper
                 let whisper_samples = if sample_rate != WHISPER_SAMPLE_RATE {
                     resample_audio(&chunk_to_send, sample_rate, WHISPER_SAMPLE_RATE)
                 } else {
                     chunk_to_send
                 };
-
-                println!(
-                    "🎙️ [RUST] Sending chunk {}: {} samples ({:.1}s)",
-                    chunk_num,
-                    whisper_samples.len(),
-                    whisper_samples.len() as f32 / WHISPER_SAMPLE_RATE as f32
-                );
-
-                match send_audio_chunk(whisper_samples, &client).await {
-                    Ok(response) => {
-                        println!(
-                            "✅ [RUST] Whisper response: {} segments",
-                            response.segments.len()
-                        );
+                
+                println!("📤 Sending to Whisper: {} samples ({:.2}s) after resample from {}Hz to {}Hz", 
+                    whisper_samples.len(), 
+                    whisper_samples.len() as f32 / WHISPER_SAMPLE_RATE as f32,
+                    sample_rate, WHISPER_SAMPLE_RATE);
+                
+                match tokio::time::timeout(
+                    Duration::from_secs(25),
+                    send_audio_chunk(whisper_samples, &client)
+                ).await {
+                    Ok(Ok(response)) => {
+                        println!("✅ Whisper response: {} segments", response.segments.len());
                         for segment in response.segments {
                             let adjusted_t0 = segment.t0 + cumulative_seconds;
                             let adjusted_t1 = segment.t1 + cumulative_seconds;
@@ -483,19 +575,21 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
                             }
                         }
                         cumulative_seconds += chunk_duration_secs;
-                        println!(
-                            "⏱️ [RUST] cumulative_seconds updated: {:.1}s (+{:.1}s)",
-                            cumulative_seconds, chunk_duration_secs
-                        );
-                    }
-                    Err(e) => {
+                        println!("⏱️ Cumulative seconds: {:.1}s", cumulative_seconds);
+                    },
+                    Ok(Err(e)) => {
                         log_error!("Transcription error: {}", e);
+                        cumulative_seconds += chunk_duration_secs;
+                    },
+                    Err(e) => {
+                        log_error!("Timeout error: {}", e);
                         cumulative_seconds += chunk_duration_secs;
                     }
                 }
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        
         if let Some(update) = accumulator.check_timeout() {
             if let Err(e) = app_handle.emit("transcript-update", update) {
                 log_error!("Failed to send final transcript update: {}", e);
@@ -515,28 +609,13 @@ async fn stop_recording(save_path: String) -> Result<(), String> {
         return Ok(());
     }
 
-    let elapsed_ms = RECORDING_START_TIME
-        .lock()
-        .unwrap()
-        .map(|start| start.elapsed().as_millis() as u64)
-        .unwrap_or(0);
-
-    if elapsed_ms < MIN_RECORDING_DURATION_MS {
-        let remaining = MIN_RECORDING_DURATION_MS - elapsed_ms;
-        log_info!(
-            "Waiting for minimum recording duration ({} ms remaining)...",
-            remaining
-        );
-        tokio::time::sleep(Duration::from_millis(remaining)).await;
-    }
-
     RECORDING_FLAG.store(false, Ordering::SeqCst);
     log_info!("Recording flag set to false");
 
     let is_running_opt = IS_RUNNING_FLAG.lock().unwrap().take();
     if let Some(is_running) = is_running_opt {
         is_running.store(false, Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
         let mic_stream_opt = MIC_STREAM.lock().unwrap().take();
         if let Some(mic_stream) = mic_stream_opt {
@@ -549,8 +628,8 @@ async fn stop_recording(save_path: String) -> Result<(), String> {
             log_info!("Stopping system stream...");
             let _ = system_stream.stop().await;
         }
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
     let mic_data = MIC_BUFFER
@@ -571,13 +650,9 @@ async fn stop_recording(save_path: String) -> Result<(), String> {
 
     for i in 0..max_len {
         let mic_sample = if i < mic_data.len() { mic_data[i] } else { 0.0 };
-        let system_sample = if i < system_data.len() {
-            system_data[i]
-        } else {
-            0.0
-        };
-        let mixed = (mic_sample * 1.2) + (system_sample * 0.7);
-        mixed_data.push(mixed.clamp(-1.0, 1.0));
+        let system_sample = if i < system_data.len() { system_data[i] } else { 0.0 };
+        let mixed = (mic_sample * MIC_VOLUME) + (system_sample * SYSTEM_VOLUME);
+        mixed_data.push(mixed.tanh());
     }
 
     if mixed_data.is_empty() {
@@ -593,8 +668,6 @@ async fn stop_recording(save_path: String) -> Result<(), String> {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
 
-    log_info!("Converted to {} bytes of PCM data", bytes.len());
-
     let data_size = bytes.len() as u32;
     let sample_rate = WAV_SAMPLE_RATE;
     let channels = 1u16;
@@ -604,7 +677,6 @@ async fn stop_recording(save_path: String) -> Result<(), String> {
     let file_size = 36 + data_size;
 
     let mut wav_file = Vec::with_capacity(44 + bytes.len());
-
     wav_file.extend_from_slice(b"RIFF");
     wav_file.extend_from_slice(&file_size.to_le_bytes());
     wav_file.extend_from_slice(b"WAVE");
@@ -620,15 +692,10 @@ async fn stop_recording(save_path: String) -> Result<(), String> {
     wav_file.extend_from_slice(&data_size.to_le_bytes());
     wav_file.extend_from_slice(&bytes);
 
-    log_info!(
-        "💾 Saving file to: {} ({} bytes)",
-        save_path,
-        wav_file.len()
-    );
+    log_info!("💾 Saving file to: {} ({} bytes)", save_path, wav_file.len());
 
     if let Some(parent) = std::path::Path::new(&save_path).parent() {
         if !parent.exists() {
-            log_info!("Creating directory: {:?}", parent);
             if let Err(e) = std::fs::create_dir_all(parent) {
                 let err_msg = format!("Failed to create save directory: {}", e);
                 log_error!("{}", err_msg);
@@ -637,7 +704,6 @@ async fn stop_recording(save_path: String) -> Result<(), String> {
         }
     }
 
-    log_info!("Saving recording to: {}", save_path);
     match fs::write(&save_path, wav_file) {
         Ok(_) => log_info!("✅ Rust saved file successfully at: {}", save_path),
         Err(e) => {
