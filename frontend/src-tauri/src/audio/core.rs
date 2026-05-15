@@ -340,11 +340,10 @@ impl AudioStream {
                     is_disconnected_clone.store(true, Ordering::Relaxed);
                 } else {
                     error!("an error occurred on the audio stream: {}", err);
-                    if err.to_string().contains("device is no longer valid") {
-                        warn!("audio device disconnected. stopping recording.");
-                        if let Some(arc) = is_running_weak_2.upgrade() {
-                            arc.store(false, Ordering::Relaxed);
-                        }
+                    if err.to_string().contains("device is no longer valid") || err.to_string().contains("no longer available") {
+                        warn!("audio device {} disconnected. Continuing with remaining devices.", device_name);
+                        is_disconnected_clone.store(true, Ordering::Relaxed);
+                        let _ = stream_control_tx_clone.send(StreamControl::Stop(oneshot::channel().0));
                     }
                 }
             };
