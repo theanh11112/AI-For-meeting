@@ -1,39 +1,60 @@
 import os
 import json
-import httpx
+import logging
+import re
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from groq import Groq
-from fastapi import BackgroundTasks
+from typing import Dict, Any, List
+
+# Cấu hình logging
+logger = logging.getLogger(__name__)
 
 # Khởi tạo Groq
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-# Resend API configuration
-RESEND_API_KEY = os.getenv("RESEND_API_KEY")
-RESEND_API_URL = "https://api.resend.com/emails"
+# Gmail SMTP Configuration
+GMAIL_USER = os.getenv("GMAIL_USER", "")
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
+
+
+def clean_email_address(raw_email: str) -> str:
+    """Làm sạch địa chỉ email, chỉ giữ lại định dạng email chuẩn"""
+    if not raw_email:
+        return ""
+
+    # Chuyển thành string
+    email_str = str(raw_email)
+
+    # Tìm pattern email
+    match = re.search(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", email_str)
+    if match:
+        cleaned = match.group(0)
+        # Xóa khoảng trắng thừa, xuống dòng, tab
+        cleaned = cleaned.strip().replace("\n", "").replace("\r", "").replace("\t", "")
+        return cleaned
+
+    return ""
 
 
 async def generate_drafts(meeting_summary: str, users_tasks: list, context: str = ""):
     """
     Tạo draft email từ meeting summary và tasks
-    Dùng Groq Llama 3.3 70B để sinh nội dung cá nhân hóa
     """
     drafts = []
 
-    # System Prompt: Định hình Người Gửi & Bối cảnh chung
     system_prompt = f"""
     Bạn là AI Email Agent chuyên nghiệp. Bạn sẽ soạn email giao việc ĐẠI DIỆN CHO thông tin người gửi/công ty sau:
-    
-    [THÔNG TIN NGƯỜI GỬI / CÔNG TY]:
     {context}
     
     [BỐI CẢNH CUỘC HỌP CHUNG]:
-    Dưới đây là tóm tắt nội dung cuộc họp vừa diễn ra. Hãy dùng thông tin này để viết phần mở đầu (lý do gửi mail) hoặc nhắc lại ngữ cảnh ngắn gọn cho tự nhiên:
     {meeting_summary}
     
     Yêu cầu đầu ra: 
     - Chỉ trả về JSON format: {{"subject": "tiêu đề", "body": "nội dung email"}}
-    - Email phải xưng hô phù hợp với thông tin người gửi, thân thiện nhưng chuyên nghiệp
-    - Body email dạng text thuần (không HTML phức tạp)
+    - Email phải xưng hô phù hợp, thân thiện nhưng chuyên nghiệp
+    - Body email dạng text thuần
     - Cuối email nhớ ký tên đại diện công ty
     """
 
@@ -47,16 +68,9 @@ async def generate_drafts(meeting_summary: str, users_tasks: list, context: str 
 
         user_prompt = f"""
         Hãy viết email cho nhân viên này:
-        - Tên người nhận: {user['name']}
+        - Tên: {user['name']}
         - Email: {user['email']}
-        
-        [NHIỆM VỤ ĐƯỢC GIAO TRONG HỌP]:
-        {tasks_text}
-        
-        Lưu ý: 
-        - Dựa vào Tóm tắt cuộc họp để viết lời dẫn
-        - Liệt kê các nhiệm vụ trên một cách rõ ràng
-        - Giọng văn phù hợp với thông tin người gửi ở trên
+        - Nhiệm vụ: {tasks_text}
         """
 
         try:
@@ -71,87 +85,118 @@ async def generate_drafts(meeting_summary: str, users_tasks: list, context: str 
             )
 
             result = json.loads(response.choices[0].message.content)
-
             drafts.append(
                 {
-                    "to_email": user["email"],
-                    "to_name": user["name"],
-                    "subject": result.get("subject", "Cập nhật công việc từ cuộc họp"),
-                    "body": result.get(
-                        "body",
-                        f"Xin chào {user['name']},\n\nĐây là email tự động từ Meetily.",
-                    ),
+                    "to_email": str(user["email"]),
+                    "to_name": str(user["name"]),
+                    "subject": str(result.get("subject", "Cập nhật công việc")),
+                    "body": str(result.get("body", "Nội dung email tự động.")),
                 }
             )
-
-            print(f"✅ Đã tạo draft cho {user['name']}")
-
+            logger.info(f"✅ Đã tạo draft cho {user['name']}")
         except Exception as e:
-            print(f"❌ Lỗi tạo email cho {user['name']}: {e}")
+            logger.error(f"❌ Lỗi tạo email cho {user['name']}: {e}")
+            # Tạo draft fallback nếu lỗi
+            drafts.append(
+                {
+                    "to_email": str(user.get("email", "")),
+                    "to_name": str(user.get("name", "")),
+                    "subject": f"Cập nhật công việc - {user.get('name', 'Nhân viên')}",
+                    "body": f"Kính gửi {user.get('name', 'Nhân viên')},\n\nDanh sách công việc được giao:\n{tasks_text}\n\nTrân trọng,\nBan Giám Đốc",
+                }
+            )
 
     return drafts
 
 
-async def send_single_email(draft: dict):
-    """
-    Gửi 1 email qua Resend API
-    Nếu không có RESEND_API_KEY, chuyển sang chế độ test (in ra console)
-    """
-    # Chế độ TEST: In ra console thay vì gửi thật
-    if not RESEND_API_KEY or RESEND_API_KEY == "your_resend_api_key_here":
-        print("\n" + "=" * 60)
-        print("📧 [TEST MODE] Email would be sent to:")
-        print(f"   To: {draft['to_name']} <{draft['to_email']}>")
-        print(f"   Subject: {draft['subject']}")
-        print(f"   Body:\n{draft['body']}")
-        print("=" * 60 + "\n")
-        return {"status": "test_mode", "to": draft["to_email"], "mode": "console"}
+async def send_single_email(draft: dict) -> Dict[str, Any]:
+    """Gửi 1 email qua Gmail SMTP với lọc email hợp lệ"""
 
-    # Chế độ THẬT: Gửi qua Resend API
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            response = await client.post(
-                RESEND_API_URL,
-                headers={
-                    "Authorization": f"Bearer {RESEND_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "from": "Meetily <onboarding@resend.dev>",  # Domain mặc định của Resend
-                    "to": [draft["to_email"]],
-                    "subject": draft["subject"],
-                    "text": draft["body"],
-                },
-            )
+    # Lấy email và làm sạch
+    raw_email = str(draft.get("to_email", ""))
+    to_email = clean_email_address(raw_email)
 
-            if response.status_code == 200:
-                result = response.json()
-                print(f"✅ Email sent to {draft['to_email']}, id: {result.get('id')}")
-                return {
-                    "status": "success",
-                    "to": draft["to_email"],
-                    "id": result.get("id"),
-                }
-            else:
-                print(f"❌ Failed to send to {draft['to_email']}: {response.text}")
-                return {
-                    "status": "error",
-                    "to": draft["to_email"],
-                    "error": response.text,
-                }
+    if not to_email:
+        logger.error(
+            f"❌ Email không hợp lệ (không tìm thấy email pattern): {raw_email}"
+        )
+        return {"status": "error", "error": f"Invalid email format: {raw_email}"}
 
-        except Exception as e:
-            print(f"❌ Exception sending to {draft['to_email']}: {e}")
-            return {"status": "error", "to": draft["to_email"], "error": str(e)}
+    # Kiểm tra email có chứa ký tự non-ASCII không
+    try:
+        to_email.encode("ascii")
+    except UnicodeEncodeError:
+        logger.error(f"❌ Email chứa ký tự non-ASCII: {to_email}")
+        return {
+            "status": "error",
+            "error": f"Email contains non-ASCII characters: {to_email}",
+        }
+
+    subject = str(draft.get("subject", ""))
+    body = str(draft.get("body", ""))
+    to_name = str(draft.get("to_name", ""))
+
+    logger.info(f"📧 Đã lọc email: {raw_email} -> {to_email}")
+    logger.info(f"📧 Đang gửi email tới: {to_name} <{to_email}>")
+
+    # Kiểm tra cấu hình Gmail
+    if not GMAIL_USER or not GMAIL_APP_PASSWORD:
+        logger.warning(
+            "⚠️ Chưa cấu hình GMAIL_USER hoặc GMAIL_APP_PASSWORD trong file .env"
+        )
+        print(f"\n📧 [TEST MODE] Gửi cho {to_name} <{to_email}>")
+        print(f"Subject: {subject}")
+        print(f"Body: {body[:200]}...")
+        return {"status": "test_mode"}
+
+    # Gửi email qua Gmail SMTP
+    try:
+        # Tạo message
+        msg = MIMEMultipart()
+        msg["From"] = GMAIL_USER
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+
+        # Kết nối SMTP và gửi
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.starttls()
+            server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+            server.send_message(msg)
+
+        logger.info(f"✅ Đã gửi email thành công tới {to_email}")
+        return {"status": "success"}
+
+    except smtplib.SMTPAuthenticationError:
+        logger.error(
+            "❌ Lỗi xác thực Gmail. Kiểm tra lại GMAIL_USER và GMAIL_APP_PASSWORD trong file .env"
+        )
+        return {
+            "status": "error",
+            "error": "SMTP Authentication failed - Check your Gmail credentials",
+        }
+    except smtplib.SMTPException as e:
+        logger.error(f"❌ Lỗi SMTP: {e}")
+        return {"status": "error", "error": f"SMTP error: {str(e)}"}
+    except Exception as e:
+        logger.error(f"❌ Lỗi gửi email: {e}")
+        return {"status": "error", "error": str(e)}
 
 
-async def send_emails_background(drafts: list):
-    """
-    Gửi nhiều email trong background
-    Trả về kết quả của từng email
-    """
-    results = []
+async def send_emails_background(drafts: list, process_id: str, db_manager: Any):
+    """Gửi nhiều email và log vào DB"""
     for draft in drafts:
         result = await send_single_email(draft)
-        results.append(result)
-    return results
+        if result["status"] in ["success", "test_mode"]:
+            await db_manager.log_email_sent(
+                process_id=process_id,
+                email=draft["to_email"],
+                name=draft["to_name"],
+                subject=draft["subject"],
+                body=draft["body"],
+            )
+            logger.info(f"✅ Đã log email tới {draft['to_email']} vào DB")
+        else:
+            logger.error(
+                f"❌ Gửi email thất bại cho {draft['to_email']}: {result.get('error', 'Unknown error')}"
+            )

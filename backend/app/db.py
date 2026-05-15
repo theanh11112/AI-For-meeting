@@ -17,7 +17,7 @@ class DatabaseManager:
 
     def _init_db(self):
         """Initialize the database with required tables"""
-        import sqlite3  # Use sync sqlite3 for initialization only
+        import sqlite3
 
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
@@ -49,6 +49,23 @@ class DatabaseManager:
                     FOREIGN KEY (process_id) REFERENCES summary_processes(id)
                 )
             """)
+
+            # 🔥 BẢNG EMAIL LOGS
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS email_logs (
+                    id TEXT PRIMARY KEY,
+                    process_id TEXT NOT NULL,
+                    recipient_email TEXT NOT NULL,
+                    recipient_name TEXT,
+                    subject TEXT,
+                    body TEXT,
+                    sent_at TEXT NOT NULL,
+                    status TEXT DEFAULT 'success',
+                    error_message TEXT,
+                    FOREIGN KEY (process_id) REFERENCES summary_processes(id)
+                )
+            """)
+
             conn.commit()
 
     @asynccontextmanager
@@ -206,7 +223,7 @@ class DatabaseManager:
                     return dict(zip([col[0] for col in cursor.description], row))
                 return None
 
-    # ==================== NEW METHODS FOR MEETING HISTORY ====================
+    # ==================== MEETING HISTORY METHODS ====================
 
     async def get_all_meetings(
         self, limit: int = 5, offset: int = 0
@@ -248,11 +265,15 @@ class DatabaseManager:
     async def delete_meeting(self, process_id: str) -> bool:
         """Xóa vĩnh viễn một cuộc họp khỏi Database"""
         async with self._get_connection() as conn:
-            # Xóa ở bảng transcripts trước (do có khóa ngoại)
+            # Xóa email logs trước (do có khóa ngoại)
+            await conn.execute(
+                "DELETE FROM email_logs WHERE process_id = ?", (process_id,)
+            )
+            # Xóa transcripts
             await conn.execute(
                 "DELETE FROM transcripts WHERE process_id = ?", (process_id,)
             )
-            # Xóa ở bảng summary_processes
+            # Xóa summary_processes
             cursor = await conn.execute(
                 "DELETE FROM summary_processes WHERE id = ?", (process_id,)
             )
@@ -264,7 +285,82 @@ class DatabaseManager:
         cutoff = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
 
         async with self._get_connection() as conn:
+            # Xóa email logs trước
+            await conn.execute(
+                "DELETE FROM email_logs WHERE process_id IN (SELECT id FROM summary_processes WHERE created_at < ?)",
+                (cutoff,),
+            )
             await conn.execute(
                 "DELETE FROM summary_processes WHERE created_at < ?", (cutoff,)
             )
             await conn.commit()
+
+    # ==================== EMAIL LOGS METHODS ====================
+
+    async def log_email_sent(
+        self,
+        process_id: str,
+        email: str,
+        name: str,
+        subject: str,
+        body: str,
+        status: str = "success",
+        error_message: str = None,
+    ):
+        """Lưu log email đã gửi vào database"""
+        log_id = str(uuid.uuid4())
+        now = datetime.utcnow().isoformat()
+
+        async with self._get_connection() as conn:
+            await conn.execute(
+                """
+                INSERT INTO email_logs 
+                (id, process_id, recipient_email, recipient_name, subject, body, sent_at, status, error_message)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    log_id,
+                    process_id,
+                    email,
+                    name,
+                    subject,
+                    body,
+                    now,
+                    status,
+                    error_message,
+                ),
+            )
+            await conn.commit()
+            logger.info(f"✅ Đã lưu log email cho process {process_id} gửi đến {email}")
+
+    async def get_email_logs(self, process_id: str) -> List[Dict[str, Any]]:
+        """Lấy lịch sử email đã gửi của một cuộc họp"""
+        async with self._get_connection() as conn:
+            async with conn.execute(
+                """
+                SELECT * FROM email_logs 
+                WHERE process_id = ? 
+                ORDER BY sent_at DESC
+                """,
+                (process_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                columns = [col[0] for col in cursor.description]
+                return [dict(zip(columns, row)) for row in rows]
+
+    async def get_all_email_logs(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Lấy tất cả email logs (có giới hạn)"""
+        async with self._get_connection() as conn:
+            async with conn.execute(
+                """
+                SELECT e.*, COALESCE(t.meeting_name, 'Unknown') as meeting_name
+                FROM email_logs e
+                LEFT JOIN transcripts t ON e.process_id = t.process_id
+                ORDER BY e.sent_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                columns = [col[0] for col in cursor.description]
+                return [dict(zip(columns, row)) for row in rows]

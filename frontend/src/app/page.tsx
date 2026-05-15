@@ -95,6 +95,7 @@ export default function Home() {
 
   const [isLoadingMeeting, setIsLoadingMeeting] = useState(false);
   const [showConfirmModal, setShowConfirmModal] = useState(false);
+  const [emailLogs, setEmailLogs] = useState<any[]>([]);
 
   const DEADLINE_OPTIONS = ['ASAP', 'Hôm nay', 'Ngày mai', 'Thứ 2 tuần sau', 'Cuối tuần này'];
 
@@ -104,11 +105,31 @@ export default function Home() {
     console.log("🔴 [DEBUG] aiSummary is:", aiSummary ? "EXISTS" : "NULL");
     if (aiSummary) {
       console.log("🔴 [DEBUG] aiSummary keys:", Object.keys(aiSummary));
-      console.log("🔴 [DEBUG] aiSummary.MeetingName:", aiSummary.MeetingName);
-      console.log("🔴 [DEBUG] aiSummary.SectionSummary:", aiSummary.SectionSummary ? "EXISTS" : "NOT");
-      console.log("🔴 [DEBUG] aiSummary.IndividualTasks:", aiSummary.IndividualTasks ? "EXISTS" : "NOT");
     }
   }, [summaryStatus, aiSummary]);
+
+  // 🔥 Load email history khi có meetingId
+  useEffect(() => {
+    if (meetingId && meetingId !== 'intro-call' && meetingId.length > 30) {
+      fetch(`http://localhost:5167/meetings/${meetingId}/email-history`)
+        .then(res => {
+          if (!res.ok) {
+            console.log(`📧 No email history found for meeting ${meetingId}`);
+            return null;
+          }
+          return res.json();
+        })
+        .then(data => {
+          if (data && data.status === 'success') {
+            setEmailLogs(data.logs);
+            console.log(`📧 Loaded ${data.logs.length} email logs`);
+          }
+        })
+        .catch(err => console.error('Failed to load email history:', err));
+    } else {
+      setEmailLogs([]);
+    }
+  }, [meetingId]);
 
   const handleUpdateTaskDeadline = useCallback((blockId: string, newDeadline: string) => {
     setAiSummary(prev => {
@@ -155,96 +176,65 @@ export default function Home() {
   const { setCurrentMeeting } = useSidebar();
 
   // Load meeting detail
-  // Load meeting detail
-const loadMeetingDetail = useCallback(async (id: string) => {
-  console.log(`📌 [STEP 1] Loading meeting detail for ID: ${id}`);
-  setIsLoadingMeeting(true);
-  setSummaryStatus('loading');
-  
-  try {
-    console.log(`📌 [STEP 2] Fetching from API: http://localhost:5167/meetings/${id}/detail`);
-    const response = await fetch(`http://localhost:5167/meetings/${id}/detail`);
+  const loadMeetingDetail = useCallback(async (id: string) => {
+    console.log(`📌 Loading meeting detail for ID: ${id}`);
+    setIsLoadingMeeting(true);
+    setSummaryStatus('loading');
     
-    console.log(`📌 [STEP 3] Response status: ${response.status}`);
-    if (!response.ok) {
-      console.warn(`❌ [STEP 4] Không tìm thấy cuộc họp với ID: ${id}, status: ${response.status}`);
-      setSummaryStatus('error');
-      setSummaryError('Không tìm thấy cuộc họp này');
-      setIsLoadingMeeting(false);
-      return;
-    }
-    
-    const data = await response.json();
-    console.log('📌 [STEP 5] Dữ liệu nhận từ API:', data);
-    console.log('📌 [STEP 6] data.status:', data.status);
-    console.log('📌 [STEP 7] data.summary exists?', !!data.summary);
-    console.log('📌 [STEP 8] data.summary type:', typeof data.summary);
-    
-    // 🔥 QUAN TRỌNG: Bỏ qua kiểm tra data.status, kiểm tra data.summary trực tiếp
-    if (data && data.summary) {
-      console.log('✅ [STEP 9] Có summary trong response, bắt đầu xử lý');
+    try {
+      const response = await fetch(`http://localhost:5167/meetings/${id}/detail`);
       
-      if (data.meeting_name) {
-        console.log(`📌 [STEP 10] Setting meeting title: ${data.meeting_name}`);
-        setMeetingTitle(data.meeting_name);
-      }
-      
-      let summaryData = data.summary;
-      console.log('📌 [STEP 11] summaryData ban đầu type:', typeof summaryData);
-      
-      // Nếu summary là string thì parse
-      if (typeof summaryData === 'string') {
-        console.log('📌 [STEP 12] summaryData là string, tiến hành parse JSON');
-        try {
-          summaryData = JSON.parse(summaryData);
-          console.log('✅ [STEP 13] Đã parse summary từ string sang object thành công');
-        } catch (e) {
-          console.error('❌ [STEP 13] Lỗi parse summary:', e);
-        }
-      }
-      
-      // Kiểm tra summaryData có phải object không
-      if (summaryData && typeof summaryData === 'object') {
-        console.log('✅ [STEP 14] summaryData là object hợp lệ');
-        console.log('📌 [STEP 15] Summary keys:', Object.keys(summaryData));
-        console.log('📌 [STEP 16] Summary.MeetingName:', summaryData.MeetingName);
-        console.log('📌 [STEP 17] Summary.SectionSummary exists?', !!summaryData.SectionSummary);
-        console.log('📌 [STEP 18] Summary.IndividualTasks exists?', !!summaryData.IndividualTasks);
-        
-        // Kiểm tra số lượng blocks
-        console.log('🔍 [STEP 19] SectionSummary blocks count:', summaryData.SectionSummary?.blocks?.length || 0);
-        console.log('🔍 [STEP 20] KeyItemsDecisions blocks count:', summaryData.KeyItemsDecisions?.blocks?.length || 0);
-        console.log('🔍 [STEP 21] IndividualTasks blocks count:', summaryData.IndividualTasks?.blocks?.length || 0);
-        
-        // 🔥 LƯU VÀO STATE
-        console.log('📌 [STEP 22] Gọi setAiSummary với dữ liệu');
-        setAiSummary(summaryData);
-        setShowSummary(true);
-        setSummaryStatus('completed');
-        console.log('✅ [STEP 23] Đã set aiSummary và summaryStatus thành completed');
-        
-        // Kiểm tra lại state sau khi set
-        console.log('📌 [STEP 24] Kiểm tra - aiSummary đã được set, summaryStatus đã thành completed');
-      } else {
-        console.error('❌ [STEP 14] summaryData không phải object:', summaryData);
+      if (!response.ok) {
+        console.warn(`Không tìm thấy cuộc họp với ID: ${id}`);
         setSummaryStatus('error');
-        setSummaryError('Dữ liệu tóm tắt không hợp lệ');
+        setSummaryError('Không tìm thấy cuộc họp này');
+        setIsLoadingMeeting(false);
+        return;
       }
-    } else {
-      console.error('❌ [STEP 9] Không có summary trong response');
-      console.log('📌 [STEP 9a] data structure:', Object.keys(data || {}));
+      
+      const data = await response.json();
+      console.log('📋 Dữ liệu nhận từ API detail:', data);
+      
+      // 🔥 SỬA: Không kiểm tra data.status, kiểm tra data.summary trực tiếp
+      if (data && data.summary) {
+        if (data.meeting_name) {
+          setMeetingTitle(data.meeting_name);
+        }
+        
+        let summaryData = data.summary;
+        if (typeof summaryData === 'string') {
+          try {
+            summaryData = JSON.parse(summaryData);
+            console.log('✅ Đã parse summary từ string sang object');
+          } catch (e) {
+            console.error('Lỗi parse summary:', e);
+          }
+        }
+        
+        if (summaryData && typeof summaryData === 'object') {
+          console.log('📊 Summary keys:', Object.keys(summaryData));
+          setAiSummary(summaryData);
+          setShowSummary(true);
+          setSummaryStatus('completed');
+          console.log('✅ Đã set aiSummary và summaryStatus thành completed');
+        } else {
+          console.warn('⚠️ summaryData không phải object:', summaryData);
+          setSummaryStatus('error');
+          setSummaryError('Dữ liệu tóm tắt không hợp lệ');
+        }
+      } else {
+        console.error('❌ Không có summary trong response');
+        setSummaryStatus('error');
+        setSummaryError('Không có dữ liệu tóm tắt');
+      }
+    } catch (err) {
+      console.error('Failed to load meeting detail:', err);
       setSummaryStatus('error');
-      setSummaryError('Không có dữ liệu tóm tắt');
+      setSummaryError('Lỗi kết nối đến server');
+    } finally {
+      setIsLoadingMeeting(false);
     }
-  } catch (err) {
-    console.error('❌ [STEP ERROR] Failed to load meeting detail:', err);
-    setSummaryStatus('error');
-    setSummaryError('Lỗi kết nối đến server');
-  } finally {
-    setIsLoadingMeeting(false);
-    console.log('📌 [STEP FINAL] setIsLoadingMeeting(false)');
-  }
-}, []);
+  }, []);
 
   // Load meeting detail chỉ khi meetingId thay đổi và hợp lệ
   useEffect(() => {
@@ -570,7 +560,6 @@ const loadMeetingDetail = useCallback(async (id: string) => {
             clearInterval(pollInterval);
             const { MeetingName, ...summaryData } = result.data;
             if (MeetingName) setMeetingTitle(MeetingName);
-            // Giữ nguyên cấu trúc từ backend
             setAiSummary({ MeetingName, ...summaryData });
             setSummaryStatus('completed');
           }
@@ -683,6 +672,23 @@ const loadMeetingDetail = useCallback(async (id: string) => {
       console.error('Lỗi reload context:', err);
     }
   };
+
+  const refreshEmailLogs = useCallback(() => {
+    if (meetingId && meetingId !== 'intro-call' && meetingId.length > 30) {
+      fetch(`http://localhost:5167/meetings/${meetingId}/email-history`)
+        .then(res => {
+          if (!res.ok) return null;
+          return res.json();
+        })
+        .then(data => {
+          if (data && data.status === 'success') {
+            setEmailLogs(data.logs);
+            console.log('📧 Đã cập nhật lịch sử email');
+          }
+        })
+        .catch(err => console.error('Failed to refresh email history:', err));
+    }
+  }, [meetingId]);
 
   useEffect(() => {
     transcriptsRef.current = transcripts;
@@ -902,8 +908,6 @@ const loadMeetingDetail = useCallback(async (id: string) => {
               </div>
             ) : (
               <div className="max-w-4xl mx-auto">
-                {/* 🔥 DEBUG PANEL - Hiển thị thông tin debug */}
-               
                 {/* Meeting Name */}
                 {aiSummary.MeetingName && (
                   <h1 className="text-2xl font-bold text-gray-800 mb-6 pb-2 border-b">
@@ -911,12 +915,10 @@ const loadMeetingDetail = useCallback(async (id: string) => {
                   </h1>
                 )}
 
-                {/* 🔥 RENDER ĐỘNG - Tự động hiển thị tất cả các section */}
+                {/* RENDER CÁC SECTION */}
                 {Object.entries(aiSummary).map(([key, value]) => {
-                  // Bỏ qua MeetingName
                   if (key === 'MeetingName') return null;
                   const section = value as any;
-                  // Kiểm tra nếu section có blocks và không rỗng
                   if (section?.blocks && Array.isArray(section.blocks) && section.blocks.length > 0) {
                     return (
                       <div key={key} className="mb-6">
@@ -978,10 +980,32 @@ const loadMeetingDetail = useCallback(async (id: string) => {
                   </div>
                 )}
 
+                {/* LỊCH SỬ EMAIL */}
+                {emailLogs.length > 0 && (
+                  <div className="mt-8 border-t border-gray-200 pt-4">
+                    <h4 className="font-bold text-sm mb-2 text-gray-700">📩 Lịch sử gửi mail:</h4>
+                    <div className="space-y-1">
+                      {emailLogs.map((log: any) => (
+                        <div key={log.id} className="text-xs text-gray-500 py-1">
+                          • Đã gửi đến <span className="font-medium">{log.recipient_email}</span> lúc {new Date(log.sent_at).toLocaleString()}
+                          <br />
+                          <span className="text-gray-400 ml-4">📝 {log.subject}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
                 {/* Email Agent */}
                 {userTasks.length > 0 && (
                   <div className="mt-6 border-t border-gray-200 pt-6">
-                    <EmailAgent meetingSummary={meetingContext} tasks={userTasks} contextFileText={companyContext} />
+                    <EmailAgent 
+                      meetingSummary={meetingContext}
+                      tasks={userTasks}
+                      contextFileText={companyContext}
+                      processId={meetingId || ""}
+                      onEmailsSent={refreshEmailLogs}
+                    />
                   </div>
                 )}
 

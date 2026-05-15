@@ -17,6 +17,7 @@ interface EmailAgentProps {
     tasks: Array<{ task_name: string; deadline: string }>;
   }>;
   contextFileText?: string;
+  processId?: string;
   onEmailsSent?: () => void;
 }
 
@@ -24,6 +25,7 @@ export default function EmailAgent({
   meetingSummary,
   tasks,
   contextFileText,
+  processId,
   onEmailsSent
 }: EmailAgentProps) {
   const [drafts, setDrafts] = useState<EmailDraft[]>([]);
@@ -79,14 +81,18 @@ export default function EmailAgent({
       const res = await fetch('http://localhost:5167/send-emails', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ drafts })
+        body: JSON.stringify({ 
+          process_id: processId,
+          drafts: drafts 
+        })
       });
 
       const data = await res.json();
 
       if (data.success) {
-        alert('✅ Email đang được gửi trong nền! Kiểm tra console (terminal) backend.');
+        alert('✅ Email đã được gửi!');
         setDrafts([]);
+        // 🔥 Gọi callback để refresh lịch sử email
         if (onEmailsSent) onEmailsSent();
       } else {
         setError(data.error || 'Lỗi khi gửi email');
