@@ -99,6 +99,9 @@ export default function Home() {
 
   const DEADLINE_OPTIONS = ['ASAP', 'Hôm nay', 'Ngày mai', 'Thứ 2 tuần sau', 'Cuối tuần này'];
 
+  // 🔥 Xác định có đang xem cuộc họp cũ không
+  const isViewingOldMeeting = meetingId && meetingId !== 'intro-call' && meetingId.length > 30;
+
   // 🔥 DEBUG: Theo dõi summaryStatus và aiSummary
   useEffect(() => {
     console.log("🔴 [DEBUG] summaryStatus changed to:", summaryStatus);
@@ -176,65 +179,131 @@ export default function Home() {
   const { setCurrentMeeting } = useSidebar();
 
   // Load meeting detail
-  const loadMeetingDetail = useCallback(async (id: string) => {
-    console.log(`📌 Loading meeting detail for ID: ${id}`);
-    setIsLoadingMeeting(true);
-    setSummaryStatus('loading');
+ const loadMeetingDetail = useCallback(async (id: string) => {
+  console.log(`📌 Loading meeting detail for ID: ${id}`);
+  setIsLoadingMeeting(true);
+  setSummaryStatus('loading');
+  
+  try {
+    const response = await fetch(`http://localhost:5167/meetings/${id}/detail`);
     
-    try {
-      const response = await fetch(`http://localhost:5167/meetings/${id}/detail`);
-      
-      if (!response.ok) {
-        console.warn(`Không tìm thấy cuộc họp với ID: ${id}`);
-        setSummaryStatus('error');
-        setSummaryError('Không tìm thấy cuộc họp này');
-        setIsLoadingMeeting(false);
-        return;
-      }
-      
-      const data = await response.json();
-      console.log('📋 Dữ liệu nhận từ API detail:', data);
-      
-      // 🔥 SỬA: Không kiểm tra data.status, kiểm tra data.summary trực tiếp
-      if (data && data.summary) {
-        if (data.meeting_name) {
-          setMeetingTitle(data.meeting_name);
-        }
-        
-        let summaryData = data.summary;
-        if (typeof summaryData === 'string') {
-          try {
-            summaryData = JSON.parse(summaryData);
-            console.log('✅ Đã parse summary từ string sang object');
-          } catch (e) {
-            console.error('Lỗi parse summary:', e);
-          }
-        }
-        
-        if (summaryData && typeof summaryData === 'object') {
-          console.log('📊 Summary keys:', Object.keys(summaryData));
-          setAiSummary(summaryData);
-          setShowSummary(true);
-          setSummaryStatus('completed');
-          console.log('✅ Đã set aiSummary và summaryStatus thành completed');
-        } else {
-          console.warn('⚠️ summaryData không phải object:', summaryData);
-          setSummaryStatus('error');
-          setSummaryError('Dữ liệu tóm tắt không hợp lệ');
-        }
-      } else {
-        console.error('❌ Không có summary trong response');
-        setSummaryStatus('error');
-        setSummaryError('Không có dữ liệu tóm tắt');
-      }
-    } catch (err) {
-      console.error('Failed to load meeting detail:', err);
+    if (!response.ok) {
+      console.warn(`Không tìm thấy cuộc họp với ID: ${id}`);
       setSummaryStatus('error');
-      setSummaryError('Lỗi kết nối đến server');
-    } finally {
+      setSummaryError('Không tìm thấy cuộc họp này');
       setIsLoadingMeeting(false);
+      return;
     }
-  }, []);
+    
+    const data = await response.json();
+    console.log('📋 Dữ liệu nhận từ API detail:', data);
+    
+    // 🔥 QUAN TRỌNG: Xử lý transcript để hiển thị đoạn hội thoại
+    if (data.transcript && typeof data.transcript === 'string') {
+      console.log(`📝 Transcript length: ${data.transcript.length} characters`);
+      setOriginalTranscript(data.transcript);
+      
+      // Parse transcript text thành các đoạn hội thoại
+      const lines = data.transcript.split('\n');
+      const parsedTranscripts: TranscriptWithSpeaker[] = [];
+      
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        
+        // Parse format: [Speaker] start - end: text
+        const match = line.match(/\[(.*?)\]\s*([\d:]+)\s*-\s*([\d:]+):\s*(.*)/);
+        if (match) {
+          const speaker = match[1];
+          const startTimeStr = match[2];
+          const endTimeStr = match[3];
+          const text = match[4];
+          
+          // Convert time string (MM:SS) to seconds
+          const parseTimeToSeconds = (timeStr: string): number => {
+            const parts = timeStr.split(':');
+            if (parts.length === 2) {
+              return parseInt(parts[0]) * 60 + parseInt(parts[1]);
+            }
+            return 0;
+          };
+          
+          parsedTranscripts.push({
+            id: `transcript-${i}-${Date.now()}`,
+            speaker: speaker,
+            text: text,
+            timestamp: `${startTimeStr} - ${endTimeStr}`,
+            t0: parseTimeToSeconds(startTimeStr),
+            t1: parseTimeToSeconds(endTimeStr),
+            seq: i,
+            isVerified: true
+          });
+        } else {
+          // Fallback: nếu không match format, tạo đoạn đơn giản
+          parsedTranscripts.push({
+            id: `transcript-${i}-${Date.now()}`,
+            speaker: 'UNKNOWN',
+            text: line,
+            timestamp: '',
+            t0: i * 10,
+            t1: i * 10 + 5,
+            seq: i,
+            isVerified: true
+          });
+        }
+      }
+      
+      if (parsedTranscripts.length > 0) {
+        setTranscripts(parsedTranscripts);
+        console.log(`✅ Đã parse ${parsedTranscripts.length} đoạn hội thoại`);
+        console.log('📝 First transcript:', parsedTranscripts[0]);
+      } else {
+        console.warn('⚠️ Không parse được đoạn hội thoại nào từ transcript');
+      }
+    } else {
+      console.warn('⚠️ Không có transcript trong response hoặc transcript không phải string');
+    }
+    
+    // Xử lý summary
+    if (data && data.summary) {
+      if (data.meeting_name) {
+        setMeetingTitle(data.meeting_name);
+      }
+      
+      let summaryData = data.summary;
+      if (typeof summaryData === 'string') {
+        try {
+          summaryData = JSON.parse(summaryData);
+          console.log('✅ Đã parse summary từ string sang object');
+        } catch (e) {
+          console.error('Lỗi parse summary:', e);
+        }
+      }
+      
+      if (summaryData && typeof summaryData === 'object') {
+        console.log('📊 Summary keys:', Object.keys(summaryData));
+        setAiSummary(summaryData);
+        setShowSummary(true);
+        setSummaryStatus('completed');
+        console.log('✅ Đã set aiSummary và summaryStatus thành completed');
+      } else {
+        console.warn('⚠️ summaryData không phải object:', summaryData);
+        setSummaryStatus('error');
+        setSummaryError('Dữ liệu tóm tắt không hợp lệ');
+      }
+    } else {
+      console.error('❌ Không có summary trong response');
+      setSummaryStatus('error');
+      setSummaryError('Không có dữ liệu tóm tắt');
+    }
+  } catch (err) {
+    console.error('Failed to load meeting detail:', err);
+    setSummaryStatus('error');
+    setSummaryError('Lỗi kết nối đến server');
+  } finally {
+    setIsLoadingMeeting(false);
+  }
+}, []);
 
   // Load meeting detail chỉ khi meetingId thay đổi và hợp lệ
   useEffect(() => {
@@ -830,25 +899,28 @@ export default function Home() {
 
                 <LanguageSelector value={targetLanguage} onChange={setTargetLanguage} isTranslating={isTranslating} />
 
-                <div className="flex items-center gap-2 mt-1">
-                  <input
-                    type="checkbox"
-                    id="enableDiarization"
-                    checked={enableDiarization}
-                    onChange={(e) => setEnableDiarization(e.target.checked)}
-                    className="w-3.5 h-3.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-                  />
-                  <label htmlFor="enableDiarization" className="text-xs text-gray-600">Phân biệt người nói (chậm hơn)</label>
-                  {isDiarizing && (
-                    <div className="flex items-center gap-1 ml-2">
-                      <svg className="animate-spin h-3 w-3 text-blue-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                      </svg>
-                      <span className="text-xs text-blue-500">Đang phân tích...</span>
-                    </div>
-                  )}
-                </div>
+                {/* 🔥 Chỉ hiển thị checkbox "Phân biệt người nói" khi đang ở chế độ recording mới */}
+                {!isViewingOldMeeting && (
+                  <div className="flex items-center gap-2 mt-1">
+                    <input
+                      type="checkbox"
+                      id="enableDiarization"
+                      checked={enableDiarization}
+                      onChange={(e) => setEnableDiarization(e.target.checked)}
+                      className="w-3.5 h-3.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                    />
+                    <label htmlFor="enableDiarization" className="text-xs text-gray-600">Phân biệt người nói (chậm hơn)</label>
+                    {isDiarizing && (
+                      <div className="flex items-center gap-1 ml-2">
+                        <svg className="animate-spin h-3 w-3 text-blue-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                        </svg>
+                        <span className="text-xs text-blue-500">Đang phân tích...</span>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
 
@@ -859,17 +931,20 @@ export default function Home() {
               onSpeakerClick={handleSpeakerClick}
             />
 
-            <div className="absolute bottom-16 left-1/2 transform -translate-x-1/2 z-10">
-              <div className="bg-white rounded-full shadow-lg flex items-center">
-                <RecordingControls
-                  isRecording={isRecording}
-                  onRecordingStop={handleRecordingStop}
-                  onRecordingStart={handleRecordingStart}
-                  onTranscriptReceived={() => {}}
-                  barHeights={barHeights}
-                />
+            {/* 🔥 Chỉ hiển thị nút Record khi không xem cuộc họp cũ */}
+            {!isViewingOldMeeting && (
+              <div className="absolute bottom-16 left-1/2 transform -translate-x-1/2 z-10">
+                <div className="bg-white rounded-full shadow-lg flex items-center">
+                  <RecordingControls
+                    isRecording={isRecording}
+                    onRecordingStop={handleRecordingStop}
+                    onRecordingStart={handleRecordingStart}
+                    onTranscriptReceived={() => {}}
+                    barHeights={barHeights}
+                  />
+                </div>
               </div>
-            </div>
+            )}
 
             <ModelSettingsModal
               isOpen={showModelSettings}
