@@ -23,8 +23,10 @@ export interface Section {
   blocks: Block[];
 }
 
+// ✅ SỬA: Summary linh hoạt với index signature
 export interface Summary {
-  [key: string]: Section;
+  MeetingName?: string;
+  [key: string]: any; // Cho phép bất kỳ key nào khác (SectionSummary, KeyItemsDecisions, IndividualTasks, v.v.)
 }
 
 export interface ApiResponse {
@@ -44,7 +46,7 @@ export interface SummaryResponse {
   };
 }
 
-// ============ THÊM CÁC INTERFACE MỚI (BẮT BUỘC) ============
+// ============ CÁC INTERFACE KHÁC ============
 
 export interface TranscriptWithSpeaker extends Transcript {
   t0: number;
@@ -75,7 +77,7 @@ export interface ModelConfig {
   whisperModel: string;
 }
 
-export type SummaryStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error';
+export type SummaryStatus = 'idle' | 'processing' | 'summarizing' | 'regenerating' | 'completed' | 'error' | 'loading';
 
 export interface TranscriptUpdate {
   text: string;
@@ -109,4 +111,27 @@ export interface AsyncSummaryResponse {
   status: 'processing' | 'completed' | 'error';
   data?: Summary;
   error?: string;
+}
+
+// ❌ XÓA các interface Summary cũ bị trùng (đã comment hoặc xóa)
+// export interface Summary {
+//     key_points: string[];
+//     action_items: string[];
+//     decisions: string[];
+//     main_topics: string[];
+//     participants?: string[];
+// }
+
+// export interface SummaryResponse {
+//     summary: Summary;
+//     raw_summary?: string;
+// }
+
+export interface ProcessRequest {
+    transcript: string;
+    metadata?: {
+        meeting_title?: string;
+        date?: string;
+        duration?: number;
+    };
 }

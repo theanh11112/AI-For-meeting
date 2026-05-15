@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { useSearchParams } from 'next/navigation';
 import { 
   TranscriptWithSpeaker, 
   Summary, 
@@ -40,22 +41,22 @@ interface OllamaModel {
   modified: string;
 }
 
-// Kiểm tra môi trường Tauri
 declare global {
   interface Window {
     __TAURI__?: any;
   }
 }
 
-// Ngôn ngữ mặc định của transcript (nguồn)
 const SOURCE_LANGUAGE = 'en';
 
 export default function Home() {
+  const searchParams = useSearchParams();
+  const meetingId = searchParams.get('id');
+  
   // States
   const [isRecording, setIsRecording] = useState(false);
   const [transcripts, setTranscripts] = useState<TranscriptWithSpeaker[]>([]);
   
-  // Tối ưu: Giảm thời gian flush xuống 500ms để hiển thị nhanh hơn
   const transcriptBufferRef = useRef<TranscriptWithSpeaker[]>([]);
   const bufferTimerRef = useRef<number | null>(null);
   const transcriptsRef = useRef<TranscriptWithSpeaker[]>([]);
@@ -92,42 +93,191 @@ export default function Home() {
   const [showModelSettings, setShowModelSettings] = useState(false);
   const [showContextModal, setShowContextModal] = useState(false);
 
-  // --- STATE VÀ LOGIC CHO EMAIL AGENT ---
-  const [companyContext, setCompanyContext] = useState<string>("Đại diện Ban Giám Đốc công ty Meetily");
+  const [isLoadingMeeting, setIsLoadingMeeting] = useState(false);
+  const [showConfirmModal, setShowConfirmModal] = useState(false);
 
+  const DEADLINE_OPTIONS = ['ASAP', 'Hôm nay', 'Ngày mai', 'Thứ 2 tuần sau', 'Cuối tuần này'];
+
+  // 🔥 DEBUG: Theo dõi summaryStatus và aiSummary
+  useEffect(() => {
+    console.log("🔴 [DEBUG] summaryStatus changed to:", summaryStatus);
+    console.log("🔴 [DEBUG] aiSummary is:", aiSummary ? "EXISTS" : "NULL");
+    if (aiSummary) {
+      console.log("🔴 [DEBUG] aiSummary keys:", Object.keys(aiSummary));
+      console.log("🔴 [DEBUG] aiSummary.MeetingName:", aiSummary.MeetingName);
+      console.log("🔴 [DEBUG] aiSummary.SectionSummary:", aiSummary.SectionSummary ? "EXISTS" : "NOT");
+      console.log("🔴 [DEBUG] aiSummary.IndividualTasks:", aiSummary.IndividualTasks ? "EXISTS" : "NOT");
+    }
+  }, [summaryStatus, aiSummary]);
+
+  const handleUpdateTaskDeadline = useCallback((blockId: string, newDeadline: string) => {
+    setAiSummary(prev => {
+      if (!prev) return prev;
+      const newSummary = JSON.parse(JSON.stringify(prev));
+      if (newSummary.IndividualTasks && newSummary.IndividualTasks.blocks) {
+        newSummary.IndividualTasks.blocks = newSummary.IndividualTasks.blocks.map((block: any) => {
+          if (block.id === blockId) {
+            let content = block.content;
+            content = content.replace(/\s*\(Deadline:\s*[^)]*\)/i, '');
+            content = `${content} (Deadline: ${newDeadline})`;
+            return { ...block, content };
+          }
+          return block;
+        });
+      }
+      return newSummary;
+    });
+  }, []);
+
+  const handleUpdateTaskContent = useCallback((blockId: string, newContent: string) => {
+    setAiSummary(prev => {
+      if (!prev) return prev;
+      const newSummary = JSON.parse(JSON.stringify(prev));
+      if (newSummary.IndividualTasks && newSummary.IndividualTasks.blocks) {
+        newSummary.IndividualTasks.blocks = newSummary.IndividualTasks.blocks.map((block: any) => {
+          if (block.id === blockId) {
+            const deadlineMatch = block.content.match(/\(Deadline:\s*[^)]*\)/i);
+            let newBlockContent = newContent;
+            if (deadlineMatch) {
+              newBlockContent = `${newContent} ${deadlineMatch[0]}`;
+            }
+            return { ...block, content: newBlockContent };
+          }
+          return block;
+        });
+      }
+      return newSummary;
+    });
+  }, []);
+
+  const [companyContext, setCompanyContext] = useState<string>("Đại diện Ban Giám Đốc công ty Meetily");
   const isStoppingRef = useRef(false);
   const { setCurrentMeeting } = useSidebar();
 
-  // Helper functions
+  // Load meeting detail
+  // Load meeting detail
+const loadMeetingDetail = useCallback(async (id: string) => {
+  console.log(`📌 [STEP 1] Loading meeting detail for ID: ${id}`);
+  setIsLoadingMeeting(true);
+  setSummaryStatus('loading');
+  
+  try {
+    console.log(`📌 [STEP 2] Fetching from API: http://localhost:5167/meetings/${id}/detail`);
+    const response = await fetch(`http://localhost:5167/meetings/${id}/detail`);
+    
+    console.log(`📌 [STEP 3] Response status: ${response.status}`);
+    if (!response.ok) {
+      console.warn(`❌ [STEP 4] Không tìm thấy cuộc họp với ID: ${id}, status: ${response.status}`);
+      setSummaryStatus('error');
+      setSummaryError('Không tìm thấy cuộc họp này');
+      setIsLoadingMeeting(false);
+      return;
+    }
+    
+    const data = await response.json();
+    console.log('📌 [STEP 5] Dữ liệu nhận từ API:', data);
+    console.log('📌 [STEP 6] data.status:', data.status);
+    console.log('📌 [STEP 7] data.summary exists?', !!data.summary);
+    console.log('📌 [STEP 8] data.summary type:', typeof data.summary);
+    
+    // 🔥 QUAN TRỌNG: Bỏ qua kiểm tra data.status, kiểm tra data.summary trực tiếp
+    if (data && data.summary) {
+      console.log('✅ [STEP 9] Có summary trong response, bắt đầu xử lý');
+      
+      if (data.meeting_name) {
+        console.log(`📌 [STEP 10] Setting meeting title: ${data.meeting_name}`);
+        setMeetingTitle(data.meeting_name);
+      }
+      
+      let summaryData = data.summary;
+      console.log('📌 [STEP 11] summaryData ban đầu type:', typeof summaryData);
+      
+      // Nếu summary là string thì parse
+      if (typeof summaryData === 'string') {
+        console.log('📌 [STEP 12] summaryData là string, tiến hành parse JSON');
+        try {
+          summaryData = JSON.parse(summaryData);
+          console.log('✅ [STEP 13] Đã parse summary từ string sang object thành công');
+        } catch (e) {
+          console.error('❌ [STEP 13] Lỗi parse summary:', e);
+        }
+      }
+      
+      // Kiểm tra summaryData có phải object không
+      if (summaryData && typeof summaryData === 'object') {
+        console.log('✅ [STEP 14] summaryData là object hợp lệ');
+        console.log('📌 [STEP 15] Summary keys:', Object.keys(summaryData));
+        console.log('📌 [STEP 16] Summary.MeetingName:', summaryData.MeetingName);
+        console.log('📌 [STEP 17] Summary.SectionSummary exists?', !!summaryData.SectionSummary);
+        console.log('📌 [STEP 18] Summary.IndividualTasks exists?', !!summaryData.IndividualTasks);
+        
+        // Kiểm tra số lượng blocks
+        console.log('🔍 [STEP 19] SectionSummary blocks count:', summaryData.SectionSummary?.blocks?.length || 0);
+        console.log('🔍 [STEP 20] KeyItemsDecisions blocks count:', summaryData.KeyItemsDecisions?.blocks?.length || 0);
+        console.log('🔍 [STEP 21] IndividualTasks blocks count:', summaryData.IndividualTasks?.blocks?.length || 0);
+        
+        // 🔥 LƯU VÀO STATE
+        console.log('📌 [STEP 22] Gọi setAiSummary với dữ liệu');
+        setAiSummary(summaryData);
+        setShowSummary(true);
+        setSummaryStatus('completed');
+        console.log('✅ [STEP 23] Đã set aiSummary và summaryStatus thành completed');
+        
+        // Kiểm tra lại state sau khi set
+        console.log('📌 [STEP 24] Kiểm tra - aiSummary đã được set, summaryStatus đã thành completed');
+      } else {
+        console.error('❌ [STEP 14] summaryData không phải object:', summaryData);
+        setSummaryStatus('error');
+        setSummaryError('Dữ liệu tóm tắt không hợp lệ');
+      }
+    } else {
+      console.error('❌ [STEP 9] Không có summary trong response');
+      console.log('📌 [STEP 9a] data structure:', Object.keys(data || {}));
+      setSummaryStatus('error');
+      setSummaryError('Không có dữ liệu tóm tắt');
+    }
+  } catch (err) {
+    console.error('❌ [STEP ERROR] Failed to load meeting detail:', err);
+    setSummaryStatus('error');
+    setSummaryError('Lỗi kết nối đến server');
+  } finally {
+    setIsLoadingMeeting(false);
+    console.log('📌 [STEP FINAL] setIsLoadingMeeting(false)');
+  }
+}, []);
+
+  // Load meeting detail chỉ khi meetingId thay đổi và hợp lệ
+  useEffect(() => {
+    if (!meetingId || meetingId === 'intro-call' || meetingId.length < 30) {
+      setShowSummary(false);
+      setAiSummary(null);
+      return;
+    }
+    loadMeetingDetail(meetingId);
+  }, [meetingId, loadMeetingDetail]);
+
   const flushTranscriptBuffer = useCallback(() => {
     const buffer = transcriptBufferRef.current;
     if (!buffer.length) return;
-
     if (bufferTimerRef.current) {
       clearTimeout(bufferTimerRef.current);
       bufferTimerRef.current = null;
     }
-
     setTranscripts(prev => {
       const combined = [...prev, ...buffer].sort((a, b) => a.t0 - b.t0);
       const result: TranscriptWithSpeaker[] = [];
-      
       for (const seg of combined) {
         if (result.length === 0) {
           result.push({ ...seg });
           continue;
         }
-
         const last = result[result.length - 1];
-
         if (Math.abs(seg.t0 - last.t0) < 0.5) {
           continue;
         }
-
         const segFirstChar = seg.text.trim().charAt(0);
         const lastTrim = last.text.trim();
         const lastEndsWithPunct = /[.!?…]$/.test(lastTrim);
-
         if (segFirstChar && segFirstChar === segFirstChar.toLowerCase() && !lastEndsWithPunct) {
           last.text = `${last.text} ${seg.text}`.trim();
           last.t1 = seg.t1;
@@ -135,15 +285,12 @@ export default function Home() {
           result.push({ ...seg });
         }
       }
-
       transcriptsRef.current = result;
       return result;
     });
-
     transcriptBufferRef.current = [];
   }, []);
 
-  // Speaker Mapping
   const fetchSpeakers = useCallback(async () => {
     try {
       const res = await fetch('http://localhost:5167/speakers');
@@ -158,21 +305,17 @@ export default function Home() {
     fetchSpeakers();
   }, [fetchSpeakers]);
 
-  // Lấy thông tin ngữ cảnh công ty từ Backend API
   useEffect(() => {
     const loadContextInfo = async () => {
       try {
         const response = await fetch('http://localhost:5167/company-context');
         const data = await response.json();
-        
         if (data.success && data.content) {
           setCompanyContext(data.content);
           console.log("✅ Đã tải context từ Backend API");
-        } else {
-          console.log("📄 Không có context từ Backend, dùng giá trị mặc định");
         }
       } catch (err) {
-        console.log("📄 Lỗi kết nối Backend, dùng giá trị mặc định của Frontend.");
+        console.log("📄 Lỗi kết nối Backend, dùng giá trị mặc định");
       }
     };
     loadContextInfo();
@@ -190,7 +333,6 @@ export default function Home() {
 
   const handleSaveSpeaker = async () => {
     if (!speakerForm.name.trim()) return;
-    
     try {
       await fetch('http://localhost:5167/speakers/map', {
         method: 'POST',
@@ -209,12 +351,9 @@ export default function Home() {
     }
   };
 
-  // Hàm dịch
   const translateSegment = useCallback(async (text: string, timestamp: string, t0: number, t1: number, speaker?: string) => {
     if (!text || text.trim() === '') return null;
-    // Nếu ngôn ngữ đích trùng với ngôn ngữ nguồn, không cần dịch
     if (targetLanguage === SOURCE_LANGUAGE) return null;
-    
     try {
       const response = await fetch('http://localhost:5167/translate', {
         method: 'POST',
@@ -226,9 +365,7 @@ export default function Home() {
           sequence: Math.floor(t0 * 100)
         })
       });
-      
       if (!response.ok) throw new Error(`Translation API error: ${response.status}`);
-      
       const data = await response.json();
       return { original: text, translated: data.translated, timestamp, t0, t1, speaker };
     } catch (err) {
@@ -237,77 +374,43 @@ export default function Home() {
     }
   }, [targetLanguage]);
 
-  // Translation useEffect
   useEffect(() => {
-    // Không dịch nếu targetLanguage trùng với SOURCE_LANGUAGE
-    if (targetLanguage === SOURCE_LANGUAGE) {
-      console.log("📄 [TRANSLATE] targetLanguage same as source, skipping translation");
-      return;
-    }
-    
-    if (transcripts.length === 0) {
-      return;
-    }
-
+    if (targetLanguage === SOURCE_LANGUAGE) return;
+    if (transcripts.length === 0) return;
     const translateAll = async () => {
       const existingTimestamps = new Set(translatedSegments.map(s => s.timestamp));
       const toTranslate = transcripts.filter(t => !existingTimestamps.has(t.timestamp));
-      
       if (toTranslate.length === 0) return;
-      
-      console.log(`🌐 [TRANSLATE] Translating ${toTranslate.length} segments from ${SOURCE_LANGUAGE} to ${targetLanguage}`);
+      console.log(`🌐 [TRANSLATE] Translating ${toTranslate.length} segments...`);
       setIsTranslating(true);
-      
       for (let i = 0; i < toTranslate.length; i++) {
         const t = toTranslate[i];
-        
         const result = await translateSegment(t.text, t.timestamp, t.t0, t.t1, t.speaker);
-        
         if (result) {
           setTranslatedSegments(prev => {
             if (prev.some(s => s.timestamp === result.timestamp)) return prev;
             return [...prev, result].sort((a, b) => a.t0 - b.t0);
           });
         }
-        
-        // Nghỉ giữa các request để tránh rate limit
-        if (i < toTranslate.length - 1) {
-          await new Promise(resolve => setTimeout(resolve, 500));
-        }
+        if (i < toTranslate.length - 1) await new Promise(resolve => setTimeout(resolve, 500));
       }
-      
       setIsTranslating(false);
     };
-    
     const timer = setTimeout(translateAll, 1000);
     return () => clearTimeout(timer);
   }, [transcripts, targetLanguage, translateSegment, translatedSegments.length]);
 
-  // Diarization
   const runDiarization = useCallback(async (audioFilePath: string) => {
-    if (!enableDiarization) {
-      console.log("Diarization disabled, skipping");
-      return;
-    }
-    
+    if (!enableDiarization) return;
     setIsDiarizing(true);
-    
     try {
-      console.log("🚀 Đang gửi file lên Backend để tinh chỉnh (WhisperX + Diarization):", audioFilePath);
-      
       const response = await fetch('http://localhost:5167/diarize-local', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ file_path: audioFilePath }),
       });
-      
-      if (!response.ok) {
-        throw new Error(`Diarization failed: ${response.status}`);
-      }
-      
+      if (!response.ok) throw new Error(`Diarization failed: ${response.status}`);
       const result = await response.json();
-      console.log("✅ Kết quả WhisperX nhận được:", result);
-      
       if (result.segments && result.segments.length > 0) {
         const finalTranscripts: TranscriptWithSpeaker[] = result.segments.map((seg: any, index: number) => ({
           id: `final-${index}-${Date.now()}`,
@@ -319,7 +422,6 @@ export default function Home() {
           seq: index,
           isVerified: true
         }));
-
         setTranscripts(finalTranscripts);
         transcriptsRef.current = finalTranscripts;
         transcriptBufferRef.current = [];
@@ -329,14 +431,12 @@ export default function Home() {
         }
       }
     } catch (err) {
-      const error = err as { name?: string; message?: string };
-      console.error("❌ Lỗi xử lý bản chuẩn:", error.message || error);
+      console.error("❌ Lỗi xử lý bản chuẩn:", err);
     } finally {
       setIsDiarizing(false);
     }
   }, [enableDiarization]);
 
-  // Recording handlers
   const handleRecordingStart = async () => {
     try {
       const isCurrentlyRecording = await invoke('is_recording');
@@ -359,36 +459,19 @@ export default function Home() {
   };
 
   const handleRecordingStop = async () => {
-    if (isStoppingRef.current) {
-      console.log("Đang xử lý stop, vui lòng đợi...");
-      return;
-    }
-    
+    if (isStoppingRef.current) return;
     isStoppingRef.current = true;
     setIsRecording(false);
-    
     try {
       const { appDataDir } = await import('@tauri-apps/api/path');
       const dataDir = await appDataDir();
       const uniqueId = Date.now();
       const audioPath = `${dataDir}recording-${uniqueId}.wav`;
-      
-      console.log("🛑 Gửi lệnh stop sang Rust với path:", audioPath);
       await invoke('stop_recording', { savePath: audioPath });
-
-      if (transcriptBufferRef.current.length > 0) {
-        flushTranscriptBuffer();
-      }
-      
-      console.log("⏳ Chờ file WAV đóng (1s)...");
+      if (transcriptBufferRef.current.length > 0) flushTranscriptBuffer();
       await new Promise(resolve => setTimeout(resolve, 1000));
       setLastAudioFile(audioPath);
-
-      if (enableDiarization) {
-        console.log("🚀 Gọi AI nhận diện người nói cho file:", audioPath);
-        await runDiarization(audioPath);
-      }
-      
+      if (enableDiarization) await runDiarization(audioPath);
       setShowSummary(true);
     } catch (err) {
       console.error('Failed to stop recording:', err);
@@ -398,55 +481,56 @@ export default function Home() {
     }
   };
 
-  // Hàm Parser: Nhào nặn dữ liệu từ aiSummary sang chuẩn của EmailAgent
   const prepareDataForEmailAgent = useCallback(() => {
     if (!aiSummary) return { meetingContext: "", userTasks: [] };
-
-    const individualTasks = (aiSummary as any).individual_tasks || (aiSummary as any).IndividualTasks;
-    
+    const individualTasks = (aiSummary as any).IndividualTasks;
     if (!individualTasks?.blocks || individualTasks.blocks.length === 0) {
       return { meetingContext: "", userTasks: [] };
     }
-
     const meetingContext = [
       (aiSummary as any).SectionSummary?.blocks?.map((b: any) => b.content).join(" ") || "",
       (aiSummary as any).KeyItemsDecisions?.blocks?.map((b: any) => b.content).join(" ") || "",
-      (aiSummary as any).key_points?.blocks?.map((b: any) => b.content).join(" ") || "",
-      (aiSummary as any).decisions?.blocks?.map((b: any) => b.content).join(" ") || "",
     ].filter(Boolean).join("\n\n");
-
     const userTasksMap = new Map();
-
     individualTasks.blocks.forEach((block: any) => {
-      const text = block.content || block.title || "";
-      const match = text.match(/^\[(.*?)\]:\s*(.*?)(?:\s*\((?:Deadline:\s*)?(.*?)\))?$/i);
-      
+      const text = block.content || "";
+      const match = text.match(/^\[(.*?)\]:\s*(.*?)(?:\s*\(Deadline:\s*(.*?)\))?$/i);
+      let name = "", task_name = "", deadline = "ASAP";
       if (match) {
-        const name = match[1].trim();
-        const task_name = match[2].trim();
-        const deadline = match[3] ? match[3].replace(')', '').trim() : "ASAP";
-
-        if (!userTasksMap.has(name)) {
-          let email = `${name.toLowerCase().replace(/\s+/g, '.')}@company.com`;
-          const speakerMap = speakerMaps.find(s => s.name === name || s.speaker_id === name);
-          if (speakerMap?.email) {
-            email = speakerMap.email;
+        name = match[1].trim();
+        task_name = match[2].trim();
+        deadline = match[3] ? match[3].trim() : "ASAP";
+      } else {
+        const commonNames = speakerMaps.map(s => s.name).concat(['Anne', 'John', 'Peter', 'Mary']);
+        for (const candidateName of commonNames) {
+          if (text.toLowerCase().startsWith(candidateName.toLowerCase())) {
+            name = candidateName;
+            task_name = text.substring(candidateName.length).trim();
+            break;
           }
-          
-          userTasksMap.set(name, {
-            name: name,
-            email: email,
-            tasks: []
-          });
         }
-        userTasksMap.get(name).tasks.push({ task_name, deadline });
+        if (!name) return;
       }
+      if (!userTasksMap.has(name)) {
+        let email = `${name.toLowerCase().replace(/\s+/g, '.')}@company.com`;
+        const speakerMap = speakerMaps.find(s => s.name === name || s.speaker_id === name);
+        if (speakerMap?.email) email = speakerMap.email;
+        userTasksMap.set(name, { name, email, tasks: [] });
+      }
+      userTasksMap.get(name).tasks.push({ task_name, deadline });
     });
-
     return { meetingContext, userTasks: Array.from(userTasksMap.values()) };
   }, [aiSummary, speakerMaps]);
 
-  // AI Summary
+  const handleGenerateClick = () => {
+    if (!transcripts.length) return;
+    if (aiSummary && summaryStatus === 'completed') {
+      setShowConfirmModal(true);
+    } else {
+      generateAISummary();
+    }
+  };
+
   const generateAISummary = useCallback(async () => {
     setSummaryStatus('processing');
     setSummaryError(null);
@@ -458,10 +542,8 @@ export default function Home() {
           return `[${speakerName}] ${formatTimeFromSeconds(t.t0)} - ${formatTimeFromSeconds(t.t1)}: ${t.text}`;
         })
         .join('\n');
-      
       if (!fullTranscript.trim()) throw new Error('No transcript text available.');
       setOriginalTranscript(fullTranscript);
-      
       const response = await fetch('http://localhost:5167/process-transcript', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -475,7 +557,6 @@ export default function Home() {
       });
       if (!response.ok) throw new Error('Failed to process transcript');
       const { process_id } = await response.json();
-      
       const pollInterval = setInterval(async () => {
         try {
           const statusResponse = await fetch(`http://localhost:5167/get-summary/${process_id}`);
@@ -489,19 +570,8 @@ export default function Home() {
             clearInterval(pollInterval);
             const { MeetingName, ...summaryData } = result.data;
             if (MeetingName) setMeetingTitle(MeetingName);
-            const formattedSummary = Object.entries(summaryData).reduce((acc: Summary, [key, section]: [string, any]) => {
-              acc[key] = {
-                title: section.title,
-                blocks: section.blocks.map((block: any) => ({
-                  ...block,
-                  type: 'bullet',
-                  color: 'default',
-                  content: block.content.trim()
-                }))
-              };
-              return acc;
-            }, {} as Summary);
-            setAiSummary(formattedSummary);
+            // Giữ nguyên cấu trúc từ backend
+            setAiSummary({ MeetingName, ...summaryData });
             setSummaryStatus('completed');
           }
         } catch (err) {
@@ -534,7 +604,6 @@ export default function Home() {
       });
       if (!response.ok) throw new Error('Failed to process transcript');
       const { process_id } = await response.json();
-      
       const pollInterval = setInterval(async () => {
         try {
           const statusResponse = await fetch(`http://localhost:5167/get-summary/${process_id}`);
@@ -548,19 +617,7 @@ export default function Home() {
             clearInterval(pollInterval);
             const { MeetingName, ...summaryData } = result.data;
             if (MeetingName) setMeetingTitle(MeetingName);
-            const formattedSummary = Object.entries(summaryData).reduce((acc: Summary, [key, section]: [string, any]) => {
-              acc[key] = {
-                title: section.title,
-                blocks: section.blocks.map((block: any) => ({
-                  ...block,
-                  type: 'bullet',
-                  color: 'default',
-                  content: block.content.trim()
-                }))
-              };
-              return acc;
-            }, {} as Summary);
-            setAiSummary(formattedSummary);
+            setAiSummary({ MeetingName, ...summaryData });
             setSummaryStatus('completed');
           }
         } catch (err) {
@@ -574,7 +631,6 @@ export default function Home() {
     }
   }, [originalTranscript, modelConfig]);
 
-  // Other handlers
   const handleCopyTranscript = useCallback(() => {
     const fullTranscript = [...transcripts]
       .sort((a, b) => a.t0 - b.t0)
@@ -585,11 +641,6 @@ export default function Home() {
       .join('\n');
     navigator.clipboard.writeText(fullTranscript);
   }, [transcripts, getSpeakerDisplayName]);
-
-  const handleGenerateSummary = useCallback(async () => {
-    if (!transcripts.length) return;
-    await generateAISummary();
-  }, [transcripts, generateAISummary]);
 
   const handleTitleChange = (newTitle: string) => {
     setMeetingTitle(newTitle);
@@ -613,12 +664,26 @@ export default function Home() {
       case 'summarizing': return 'Generating AI summary...';
       case 'regenerating': return 'Regenerating AI summary...';
       case 'completed': return 'Summary generated successfully!';
+      case 'loading': return 'Loading meeting...';
       case 'error': return summaryError || 'An error occurred';
       default: return '';
     }
   };
 
-  // Effects
+  const { meetingContext, userTasks } = prepareDataForEmailAgent();
+  const reloadContext = async () => {
+    try {
+      const response = await fetch('http://localhost:5167/company-context');
+      const data = await response.json();
+      if (data.success && data.content) {
+        setCompanyContext(data.content);
+        console.log("✅ Đã reload context từ Backend API");
+      }
+    } catch (err) {
+      console.error('Lỗi reload context:', err);
+    }
+  };
+
   useEffect(() => {
     transcriptsRef.current = transcripts;
   }, [transcripts]);
@@ -642,10 +707,9 @@ export default function Home() {
     }
   }, [isRecording]);
 
-  // Xử lý transcript real-time không chờ timeout
+  // Xử lý transcript real-time
   useEffect(() => {
     let unlistenFn: (() => void) | undefined;
-
     const setupListener = async () => {
       try {
         unlistenFn = await listen<TranscriptUpdate>('transcript-update', (event) => {
@@ -653,9 +717,7 @@ export default function Home() {
           const t0 = payload.t0 ?? 0;
           const t1 = payload.t1 ?? 0;
           const seq = payload.seq ?? 0;
-
-          console.log(`📝 [FRONTEND] Received: seq=${seq}, t0=${t0.toFixed(2)}s, text="${payload.text.substring(0, 50)}"`);
-          
+          console.log(`📝 [FRONTEND] Received: seq=${seq}, t0=${t0.toFixed(2)}s`);
           const newTranscript: TranscriptWithSpeaker = {
             id: `${seq}-${Date.now()}`,
             text: payload.text,
@@ -666,20 +728,11 @@ export default function Home() {
             seq: seq,
             isVerified: false
           };
-          
           const existsInBuffer = transcriptBufferRef.current.some(s => s.seq === seq);
           const existsInTranscripts = transcriptsRef.current.some(s => s.seq === seq);
-
-          if (existsInBuffer || existsInTranscripts) {
-            console.log(`⏭️ Bỏ qua tin trùng: seq=${seq}`);
-            return;
-          }
-
+          if (existsInBuffer || existsInTranscripts) return;
           transcriptBufferRef.current.push(newTranscript);
-
-          if (bufferTimerRef.current) {
-            clearTimeout(bufferTimerRef.current);
-          }
+          if (bufferTimerRef.current) clearTimeout(bufferTimerRef.current);
           bufferTimerRef.current = window.setTimeout(() => {
             flushTranscriptBuffer();
             bufferTimerRef.current = null;
@@ -689,14 +742,10 @@ export default function Home() {
         console.error('Failed to setup transcript listener:', err);
       }
     };
-    
     setupListener();
     return () => { 
       if (unlistenFn) unlistenFn(); 
-      if (bufferTimerRef.current) {
-        clearTimeout(bufferTimerRef.current);
-        bufferTimerRef.current = null;
-      }
+      if (bufferTimerRef.current) clearTimeout(bufferTimerRef.current);
     };
   }, [flushTranscriptBuffer]);
 
@@ -728,199 +777,254 @@ export default function Home() {
 
   const isSummaryLoading = summaryStatus === 'processing' || summaryStatus === 'summarizing' || summaryStatus === 'regenerating';
 
-  // Lấy dữ liệu cho EmailAgent
-  const { meetingContext, userTasks } = prepareDataForEmailAgent();
-
-  const reloadContext = async () => {
-    try {
-      const response = await fetch('http://localhost:5167/company-context');
-      const data = await response.json();
-      if (data.success && data.content) {
-        setCompanyContext(data.content);
-        console.log("✅ Đã reload context từ Backend API");
-      }
-    } catch (err) {
-      console.error('Lỗi reload context:', err);
-    }
+  // 🔥 DEBUG RENDER CONDITION
+  const renderCondition = {
+    isLoadingMeeting,
+    isSummaryLoading,
+    hasAiSummary: !!aiSummary,
+    summaryStatus,
+    showSummary
   };
+  console.log("🔴 [RENDER] Render condition:", renderCondition);
 
   // Render
   return (
-    <div className="flex flex-col h-screen bg-gray-50">
-      {/* Nút cấu hình công ty ở góc trên cùng */}
-      <div className="fixed top-4 right-4 z-50">
-        <button
-          onClick={() => setShowContextModal(true)}
-          className="px-3 py-2 text-sm bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition shadow-lg flex items-center gap-2"
-        >
-          🏢 Cấu hình công ty
-        </button>
-      </div>
-
-      <div className="flex flex-1 overflow-hidden">
-        {/* Left side - Transcript */}
-        <div className="w-1/3 min-w-[300px] border-r border-gray-200 bg-white flex flex-col relative">
-          {/* Header area */}
-          <div className="p-4 border-b border-gray-200">
-            <div className="flex flex-col space-y-3">
-              <div className="flex items-center">
-                <EditableTitle
-                  title={meetingTitle}
-                  isEditing={isEditingTitle}
-                  onStartEditing={() => setIsEditingTitle(true)}
-                  onFinishEditing={() => setIsEditingTitle(false)}
-                  onChange={handleTitleChange}
-                />
-              </div>
-
-              <Toolbar
-                onCopy={handleCopyTranscript}
-                onGenerate={handleGenerateSummary}
-                onOpenSettings={() => setShowModelSettings(true)}
-                isGenerating={summaryStatus === 'processing'}
-                hasTranscripts={transcripts.length > 0}
-                showSummary={showSummary}
-                isRecording={isRecording}
-              />
-
-              <LanguageSelector
-                value={targetLanguage}
-                onChange={setTargetLanguage}
-                isTranslating={isTranslating}
-              />
-
-              <div className="flex items-center gap-2 mt-1">
-                <input
-                  type="checkbox"
-                  id="enableDiarization"
-                  checked={enableDiarization}
-                  onChange={(e) => setEnableDiarization(e.target.checked)}
-                  className="w-3.5 h-3.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-                />
-                <label htmlFor="enableDiarization" className="text-xs text-gray-600">
-                  Phân biệt người nói (chậm hơn)
-                </label>
-                {isDiarizing && (
-                  <div className="flex items-center gap-1 ml-2">
-                    <svg className="animate-spin h-3 w-3 text-blue-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                    </svg>
-                    <span className="text-xs text-blue-500">Đang phân tích...</span>
-                  </div>
-                )}
-              </div>
-            </div>
-          </div>
-
-          <TranscriptList
-            transcripts={transcripts}
-            translatedSegments={translatedSegments}
-            getSpeakerDisplayName={getSpeakerDisplayName}
-            onSpeakerClick={handleSpeakerClick}
-          />
-
-          <div className="absolute bottom-16 left-1/2 transform -translate-x-1/2 z-10">
-            <div className="bg-white rounded-full shadow-lg flex items-center">
-              <RecordingControls
-                isRecording={isRecording}
-                onRecordingStop={handleRecordingStop}
-                onRecordingStart={handleRecordingStart}
-                onTranscriptReceived={() => {}}
-                barHeights={barHeights}
-              />
-            </div>
-          </div>
-
-          <ModelSettingsModal
-            isOpen={showModelSettings}
-            onClose={() => setShowModelSettings(false)}
-            config={modelConfig}
-            onConfigChange={setModelConfig}
-            models={models}
-            error={error}
-          />
-
-          <SpeakerModal
-            isOpen={showSpeakerModal}
-            onClose={() => setShowSpeakerModal(false)}
-            speakerId={editingSpeakerId}
-            name={speakerForm.name}
-            email={speakerForm.email}
-            onNameChange={(name) => setSpeakerForm(prev => ({ ...prev, name }))}
-            onEmailChange={(email) => setSpeakerForm(prev => ({ ...prev, email }))}
-            onSave={handleSaveSpeaker}
-          />
+    <>
+      <div className="flex flex-col h-screen bg-gray-50">
+        <div className="fixed top-4 right-4 z-50">
+          <button onClick={() => setShowContextModal(true)} className="px-3 py-2 text-sm bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition shadow-lg flex items-center gap-2">
+            🏢 Cấu hình công ty
+          </button>
         </div>
 
-        {/* Right side - AI Summary & Email Agent */}
-        <div className="flex-1 overflow-y-auto bg-white">
-          {isSummaryLoading ? (
-            <div className="flex items-center justify-center h-full">
-              <div className="text-center">
-                <div className="inline-block animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-blue-500 mb-4"></div>
-                <p className="text-gray-600">Đang tạo tóm tắt AI...</p>
-              </div>
-            </div>
-          ) : showSummary && (
-            <div className="max-w-4xl mx-auto p-6">
-              <div className="flex-1 overflow-y-auto">
-                <AISummary 
-                  summary={aiSummary} 
-                  status={summaryStatus} 
-                  error={summaryError}
-                  onSummaryChange={(newSummary) => setAiSummary(newSummary)}
-                  onRegenerateSummary={handleRegenerateSummary}
-                />
-
-                {/* PHẦN HIỂN THỊ EMAIL AGENT */}
-                {summaryStatus === 'completed' && userTasks.length > 0 && (
-                  <div className="mt-8 border-t border-gray-200 pt-6">
-                    <EmailAgent 
-                      meetingSummary={meetingContext}
-                      tasks={userTasks}
-                      contextFileText={companyContext}
-                    />
-                  </div>
-                )}
-              </div>
-
-              {summaryStatus !== 'idle' && (
-                <div className={`mt-4 p-4 rounded-lg ${
-                  summaryStatus === 'error' ? 'bg-red-100 text-red-700' :
-                  summaryStatus === 'completed' ? 'bg-green-100 text-green-700' :
-                  'bg-blue-100 text-blue-700'
-                }`}>
-                  <p className="text-sm font-medium">{getSummaryStatusMessage(summaryStatus)}</p>
+        <div className="flex flex-1 overflow-hidden">
+          {/* Left side - Transcript */}
+          <div className="w-1/3 min-w-[300px] border-r border-gray-200 bg-white flex flex-col relative">
+            <div className="p-4 border-b border-gray-200">
+              <div className="flex flex-col space-y-3">
+                <div className="flex items-center">
+                  <EditableTitle
+                    title={meetingTitle}
+                    isEditing={isEditingTitle}
+                    onStartEditing={() => setIsEditingTitle(true)}
+                    onFinishEditing={() => setIsEditingTitle(false)}
+                    onChange={handleTitleChange}
+                  />
                 </div>
-              )}
+
+                <Toolbar
+                  onCopy={handleCopyTranscript}
+                  onGenerate={handleGenerateClick}
+                  onOpenSettings={() => setShowModelSettings(true)}
+                  isGenerating={summaryStatus === 'processing'}
+                  hasTranscripts={transcripts.length > 0}
+                  showSummary={showSummary}
+                  isRecording={isRecording}
+                />
+
+                <LanguageSelector value={targetLanguage} onChange={setTargetLanguage} isTranslating={isTranslating} />
+
+                <div className="flex items-center gap-2 mt-1">
+                  <input
+                    type="checkbox"
+                    id="enableDiarization"
+                    checked={enableDiarization}
+                    onChange={(e) => setEnableDiarization(e.target.checked)}
+                    className="w-3.5 h-3.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                  />
+                  <label htmlFor="enableDiarization" className="text-xs text-gray-600">Phân biệt người nói (chậm hơn)</label>
+                  {isDiarizing && (
+                    <div className="flex items-center gap-1 ml-2">
+                      <svg className="animate-spin h-3 w-3 text-blue-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                      </svg>
+                      <span className="text-xs text-blue-500">Đang phân tích...</span>
+                    </div>
+                  )}
+                </div>
+              </div>
             </div>
-          )}
+
+            <TranscriptList
+              transcripts={transcripts}
+              translatedSegments={translatedSegments}
+              getSpeakerDisplayName={getSpeakerDisplayName}
+              onSpeakerClick={handleSpeakerClick}
+            />
+
+            <div className="absolute bottom-16 left-1/2 transform -translate-x-1/2 z-10">
+              <div className="bg-white rounded-full shadow-lg flex items-center">
+                <RecordingControls
+                  isRecording={isRecording}
+                  onRecordingStop={handleRecordingStop}
+                  onRecordingStart={handleRecordingStart}
+                  onTranscriptReceived={() => {}}
+                  barHeights={barHeights}
+                />
+              </div>
+            </div>
+
+            <ModelSettingsModal
+              isOpen={showModelSettings}
+              onClose={() => setShowModelSettings(false)}
+              config={modelConfig}
+              onConfigChange={setModelConfig}
+              models={models}
+              error={error}
+            />
+
+            <SpeakerModal
+              isOpen={showSpeakerModal}
+              onClose={() => setShowSpeakerModal(false)}
+              speakerId={editingSpeakerId}
+              name={speakerForm.name}
+              email={speakerForm.email}
+              onNameChange={(name) => setSpeakerForm(prev => ({ ...prev, name }))}
+              onEmailChange={(email) => setSpeakerForm(prev => ({ ...prev, email }))}
+              onSave={handleSaveSpeaker}
+            />
+          </div>
+
+          {/* Right side - AI Summary & Email Agent */}
+          <div className="flex-1 overflow-y-auto bg-white p-6">
+            {isLoadingMeeting || isSummaryLoading ? (
+              <div className="flex items-center justify-center h-full">
+                <div className="text-center">
+                  <div className="inline-block animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-blue-500 mb-4"></div>
+                  <p className="text-gray-600">{isLoadingMeeting ? 'Đang tải cuộc họp...' : 'Đang tạo tóm tắt AI...'}</p>
+                </div>
+              </div>
+            ) : !aiSummary ? (
+              <div className="flex flex-col items-center justify-center h-full text-gray-400">
+                <p>Chọn một cuộc họp từ Sidebar</p>
+                <p className="text-sm">Hoặc nhấn "Record" để bắt đầu cuộc họp mới</p>
+              </div>
+            ) : (
+              <div className="max-w-4xl mx-auto">
+                {/* 🔥 DEBUG PANEL - Hiển thị thông tin debug */}
+               
+                {/* Meeting Name */}
+                {aiSummary.MeetingName && (
+                  <h1 className="text-2xl font-bold text-gray-800 mb-6 pb-2 border-b">
+                    {aiSummary.MeetingName}
+                  </h1>
+                )}
+
+                {/* 🔥 RENDER ĐỘNG - Tự động hiển thị tất cả các section */}
+                {Object.entries(aiSummary).map(([key, value]) => {
+                  // Bỏ qua MeetingName
+                  if (key === 'MeetingName') return null;
+                  const section = value as any;
+                  // Kiểm tra nếu section có blocks và không rỗng
+                  if (section?.blocks && Array.isArray(section.blocks) && section.blocks.length > 0) {
+                    return (
+                      <div key={key} className="mb-6">
+                        <h3 className="text-lg font-semibold text-gray-800 mb-3">{section.title || key}</h3>
+                        <div className="space-y-2">
+                          {section.blocks.map((block: any, idx: number) => (
+                            <div key={block.id || idx} className="p-3 bg-gray-50 rounded-lg">
+                              <p className="text-gray-700">{block.content}</p>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  }
+                  return null;
+                })}
+
+                {/* Individual Tasks với giao diện chỉnh sửa */}
+                {aiSummary.IndividualTasks && aiSummary.IndividualTasks.blocks?.length > 0 && (
+                  <div className="mt-6 p-5 bg-indigo-50/50 border border-indigo-100 rounded-xl shadow-sm">
+                    <h4 className="text-sm font-bold text-indigo-800 mb-4 flex items-center gap-2">
+                      📋 Danh sách công việc được giao
+                    </h4>
+                    <div className="space-y-3">
+                      {aiSummary.IndividualTasks.blocks.map((block: any) => {
+                        const match = block.content.match(/^\[(.*?)\]:\s*(.*?)(?:\s*\(Deadline:\s*(.*?)\))?$/i);
+                        const assignee = match ? match[1] : "";
+                        const taskContent = match ? match[2] : block.content;
+                        const currentDeadline = match && match[3] ? match[3] : "";
+                        if (!assignee) return null;
+                        return (
+                          <div key={block.id} className="flex flex-col gap-2 bg-white p-4 rounded-lg border shadow-sm hover:border-indigo-300 transition-all">
+                            <div className="flex items-center gap-2">
+                              <span className="font-bold text-indigo-700 bg-indigo-50 px-2 py-1 rounded text-xs">👤 {assignee}</span>
+                            </div>
+                            <input
+                              type="text"
+                              defaultValue={taskContent}
+                              onBlur={(e) => handleUpdateTaskContent(block.id, e.target.value)}
+                              className="w-full p-2 text-sm text-gray-800 bg-gray-50 border border-transparent rounded hover:bg-white hover:border-gray-200 focus:bg-white focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100 transition outline-none"
+                            />
+                            <div className="flex items-center gap-2 self-end mt-1">
+                              <span className="text-[10px] font-bold text-gray-400 uppercase">Hạn chót:</span>
+                              <select
+                                value={currentDeadline || "ASAP"}
+                                onChange={(e) => handleUpdateTaskDeadline(block.id, e.target.value)}
+                                className="text-xs font-medium text-indigo-600 bg-transparent border-none cursor-pointer hover:underline outline-none"
+                              >
+                                {DEADLINE_OPTIONS.map(opt => <option key={opt} value={opt}>{opt}</option>)}
+                              </select>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    <p className="text-xs text-indigo-500 mt-3 text-center">
+                      💡 Click vào nội dung để sửa, click ra ngoài để lưu. Chọn hạn chót để kích hoạt nút "Soạn Email Tự Động"
+                    </p>
+                  </div>
+                )}
+
+                {/* Email Agent */}
+                {userTasks.length > 0 && (
+                  <div className="mt-6 border-t border-gray-200 pt-6">
+                    <EmailAgent meetingSummary={meetingContext} tasks={userTasks} contextFileText={companyContext} />
+                  </div>
+                )}
+
+                {/* Status message */}
+                {summaryStatus !== 'idle' && summaryStatus !== 'loading' && (
+                  <div className={`mt-4 p-4 rounded-lg ${
+                    summaryStatus === 'error' ? 'bg-red-100 text-red-700' :
+                    summaryStatus === 'completed' ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700'
+                  }`}>
+                    <p className="text-sm font-medium">{getSummaryStatusMessage(summaryStatus)}</p>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </div>
+
+        {showContextModal && (
+          <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+            <div className="bg-white rounded-lg p-6 max-w-2xl w-full max-h-[80vh] overflow-y-auto">
+              <div className="flex justify-between items-center mb-4">
+                <h2 className="text-xl font-bold">🏢 Thông tin công ty</h2>
+                <button onClick={() => setShowContextModal(false)} className="text-gray-500 hover:text-gray-700 text-2xl">✕</button>
+              </div>
+              <CompanyContextManager onClose={() => { setShowContextModal(false); reloadContext(); }} />
+            </div>
+          </div>
+        )}
       </div>
 
-      {/* Modal cấu hình công ty */}
-      {showContextModal && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-lg p-6 max-w-2xl w-full max-h-[80vh] overflow-y-auto">
-            <div className="flex justify-between items-center mb-4">
-              <h2 className="text-xl font-bold"> Thông tin công ty</h2>
-              <button
-                onClick={() => setShowContextModal(false)}
-                className="text-gray-500 hover:text-gray-700 text-2xl"
-              >
-                ✕
-              </button>
+      {/* Confirm Modal */}
+      {showConfirmModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+          <div className="bg-white p-6 rounded-lg shadow-xl w-96">
+            <h3 className="font-bold text-lg">Tạo lại tóm tắt?</h3>
+            <p className="text-sm text-gray-600 mt-2">Dữ liệu tóm tắt hiện tại sẽ bị thay thế. Bạn chắc chắn muốn tạo lại?</p>
+            <div className="flex gap-2 mt-4 justify-end">
+              <button onClick={() => setShowConfirmModal(false)} className="px-4 py-2 text-gray-600 hover:bg-gray-100 rounded transition">Hủy</button>
+              <button onClick={() => { setShowConfirmModal(false); generateAISummary(); }} className="px-4 py-2 bg-red-600 text-white rounded hover:bg-red-700 transition">Xác nhận</button>
             </div>
-            <CompanyContextManager 
-              onClose={() => {
-                setShowContextModal(false);
-                reloadContext();
-              }}
-            />
           </div>
         </div>
       )}
-    </div>
+    </>
   );
 }

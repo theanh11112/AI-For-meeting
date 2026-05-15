@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::time::Duration;
@@ -24,9 +24,17 @@ const SENTENCE_TIMEOUT_MS: u64 = 800;
 const MIN_CHUNK_DURATION_MS: u32 = 1500; // 1.5 giây - KHÔNG GỬI CHUNK NGẮN HƠN
 const MIN_RECORDING_DURATION_MS: u64 = 2000;
 
-// VAD threshold - đã tối ưu
+// VAD threshold - cho MIC (chống nhiễu môi trường)
 const VOICE_ACTIVITY_THRESHOLD: f32 = 0.012;
 const MAX_SENTENCE_LENGTH: usize = 200;
+
+// 🔥 THÊM: Voice Hold Time - giữ chunk sau khi ngừng nói
+const VOICE_HOLD_TIME_MS: u64 = 500; // 500ms
+
+// 🔥 THÊM: Feedback Detection thresholds
+const FEEDBACK_PEAK_THRESHOLD: f32 = 0.85;
+const FEEDBACK_RMS_THRESHOLD: f32 = 0.35;
+const FEEDBACK_MAX_COUNT: usize = 3;
 
 // Tỷ lệ mix audio
 const MIC_VOLUME: f32 = 1.2;
@@ -44,6 +52,10 @@ static MIC_STREAM: Mutex<Option<Arc<AudioStream>>> = Mutex::new(None);
 static SYSTEM_STREAM: Mutex<Option<Arc<AudioStream>>> = Mutex::new(None);
 static IS_RUNNING_FLAG: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
 static RECORDING_START_TIME: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+// 🔥 THÊM: Voice Hold và Feedback tracking
+static LAST_VOICE_TIME: AtomicU64 = AtomicU64::new(0);
+static FEEDBACK_DETECTION_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Serialize, Clone)]
 struct TranscriptUpdate {
@@ -210,13 +222,12 @@ impl TranscriptAccumulator {
     }
 }
 
-// 🔥 QUAN TRỌNG: Hàm VAD nhận thêm tham số sample_rate
+// Hàm VAD cho MIC
 fn has_voice_activity(samples: &[f32], threshold: f32, sample_rate: u32) -> bool {
     if samples.is_empty() {
         return false;
     }
     
-    // Window 30ms dựa trên sample_rate thực tế
     let window_size = (sample_rate as f32 * 0.030) as usize;
     let step = window_size / 2;
     
@@ -245,6 +256,19 @@ fn has_voice_activity(samples: &[f32], threshold: f32, sample_rate: u32) -> bool
     false
 }
 
+// 🔥 THÊM: Hàm kiểm tra system audio với ngưỡng thấp (bắt được dù bị ducking)
+fn has_system_audio(samples: &[f32], threshold: f32) -> bool {
+    if samples.is_empty() {
+        return false;
+    }
+    for &s in samples {
+        if s.abs() > threshold {
+            return true;
+        }
+    }
+    false
+}
+
 fn estimate_chunk_quality(samples: &[f32]) -> (f32, f32) {
     if samples.is_empty() {
         return (0.0, 0.0);
@@ -262,6 +286,15 @@ fn estimate_chunk_quality(samples: &[f32]) -> (f32, f32) {
     
     let rms = (sum_sq / samples.len() as f32).sqrt();
     (rms, peak)
+}
+
+// 🔥 THÊM: Hàm lọc echo đơn giản (chỉ bật khi phát hiện feedback)
+fn apply_simple_aec(mic: f32, system: f32, is_feedback_mode: bool) -> f32 {
+    if !is_feedback_mode {
+        return mic;
+    }
+    // Giảm 15% hệ thống ra khỏi mic khi đang bị feedback
+    (mic - (system * 0.15)).clamp(-1.0, 1.0)
 }
 
 fn resample_audio(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
@@ -407,15 +440,16 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     let chunk_counter_clone = chunk_counter.clone();
     let mut accumulator = TranscriptAccumulator::new();
     let mut cumulative_seconds: f32 = 0.0;
-    let device_config = mic_stream.device_config.clone();
-    let sample_rate = device_config.sample_rate().0;
-    let channels = device_config.channels();
+    
+    let mic_sample_rate = mic_stream.device_config.sample_rate().0;
+    let system_sample_rate = system_stream.device_config.sample_rate().0;
+    let sample_rate = mic_sample_rate;
+    let channels = mic_stream.device_config.channels();
     
     println!("⏱️ [RUST] cumulative_seconds initialized to 0.0");
-    println!("🎙️ [RUST] Device sample rate: {} Hz", sample_rate);
+    println!("🎙️ [RUST] Device sample rates: Mic={} Hz, System={} Hz", mic_sample_rate, system_sample_rate);
 
     tokio::spawn(async move {
-        // 🔥 QUAN TRỌNG: Dùng sample_rate thực tế để tính số samples
         let target_samples = (sample_rate as f32 * (CHUNK_DURATION_MS as f32 / 1000.0)) as usize;
         let overlap_samples = (sample_rate as f32 * (CHUNK_OVERLAP_MS as f32 / 1000.0)) as usize;
         let min_samples = (sample_rate as f32 * (MIN_CHUNK_DURATION_MS as f32 / 1000.0)) as usize;
@@ -423,6 +457,8 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
         let mut last_chunk_tail: Vec<f32> = Vec::new();
         let mut last_chunk_time = std::time::Instant::now();
         let mut silent_chunks_count = 0;
+        let mut is_feedback_mode = false;
+        let mut chunk_has_system_audio = false;
         
         log_info!("Mic config: {} Hz, {} channels", sample_rate, channels);
         log_info!("Chunk config: target={} samples ({}s), min={} samples ({}s)", 
@@ -438,7 +474,7 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
             
             let mut new_samples = Vec::new();
             let mut mic_samples = Vec::new();
-            let mut system_samples = Vec::new();
+            let mut system_raw_samples = Vec::new();
 
             while let Ok(chunk) = mic_receiver_clone.try_recv() {
                 let chunk_clone = chunk.clone();
@@ -452,7 +488,7 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
             
             while let Ok(chunk) = system_receiver.try_recv() {
                 let chunk_clone = chunk.clone();
-                system_samples.extend(chunk);
+                system_raw_samples.extend(chunk);
                 if let Some(buffer) = SYSTEM_BUFFER.lock().unwrap().as_ref() {
                     if let Ok(mut guard) = buffer.lock() {
                         guard.extend(chunk_clone);
@@ -460,13 +496,65 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
                 }
             }
             
-            // Mix audio
+            // Resample system audio nếu cần
+            let system_samples = if system_sample_rate != mic_sample_rate && !system_raw_samples.is_empty() {
+                resample_audio(&system_raw_samples, system_sample_rate, mic_sample_rate)
+            } else {
+                system_raw_samples
+            };
+            
+            // 🔥 KIỂM TRA SYSTEM AUDIO (ngưỡng thấp 0.003 để bắt dù bị ducking)
+            const SYSTEM_AUDIO_THRESHOLD: f32 = 0.003;
+            if has_system_audio(&system_samples, SYSTEM_AUDIO_THRESHOLD) {
+                chunk_has_system_audio = true;
+            }
+            
+            // 🔥 KIỂM TRA MIC VOICE (cho Voice Hold)
+            let has_mic_voice = has_voice_activity(&mic_samples, VOICE_ACTIVITY_THRESHOLD, sample_rate);
+            
+            // 🔥 CẬP NHẬT VOICE HOLD TIME
+            if has_mic_voice {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                LAST_VOICE_TIME.store(now, Ordering::SeqCst);
+            }
+            
+            // Mix audio với AEC (chỉ bật khi feedback mode)
             let max_len = mic_samples.len().max(system_samples.len());
             for i in 0..max_len {
                 let mic_sample = if i < mic_samples.len() { mic_samples[i] } else { 0.0 };
                 let system_sample = if i < system_samples.len() { system_samples[i] } else { 0.0 };
-                let mixed = (mic_sample * MIC_VOLUME) + (system_sample * SYSTEM_VOLUME);
+                
+                let mic_cleaned = apply_simple_aec(mic_sample, system_sample, is_feedback_mode);
+                let mixed = (mic_cleaned * MIC_VOLUME) + (system_sample * SYSTEM_VOLUME);
                 new_samples.push(mixed.tanh());
+            }
+            
+            // 🔥 KIỂM TRA FEEDBACK
+            let (rms, peak) = estimate_chunk_quality(&new_samples);
+            let is_feedback = peak > FEEDBACK_PEAK_THRESHOLD && rms > FEEDBACK_RMS_THRESHOLD;
+            
+            if is_feedback {
+                let count = FEEDBACK_DETECTION_COUNT.fetch_add(1, Ordering::SeqCst);
+                if count >= FEEDBACK_MAX_COUNT {
+                    if !is_feedback_mode {
+                        is_feedback_mode = true;
+                        println!("⚠️ FEEDBACK LOOP DETECTED! Switching to AEC mode.");
+                        // Gửi event về frontend
+                        let _ = app_handle.emit("feedback-detected", true);
+                    }
+                }
+            } else {
+                FEEDBACK_DETECTION_COUNT.store(0, Ordering::SeqCst);
+                // Tự động tắt feedback mode sau 3 giây không còn feedback
+                if is_feedback_mode {
+                    tokio::time::sleep(Duration::from_millis(3000)).await;
+                    is_feedback_mode = false;
+                    println!("✅ Feedback resolved. Exiting AEC mode.");
+                    let _ = app_handle.emit("feedback-detected", false);
+                }
             }
             
             let samples_to_process = if !last_chunk_tail.is_empty() {
@@ -482,7 +570,6 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
             }
 
             let time_elapsed = last_chunk_time.elapsed();
-            
             let mut should_send = false;
             
             if current_chunk.len() >= target_samples {
@@ -492,7 +579,6 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
                 should_send = true;
             }
             
-            // KHÔNG BAO GIỜ GỬI CHUNK DƯỚI min_samples
             if current_chunk.len() < min_samples {
                 should_send = false;
             }
@@ -501,21 +587,39 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
                 let chunk_to_send = current_chunk.clone();
                 let chunk_duration_secs = chunk_to_send.len() as f32 / sample_rate as f32;
                 
-                // 🔥 Gọi VAD với sample_rate thực tế
-                let has_voice = if chunk_to_send.len() >= min_samples {
+                // 🔥 VAD cho mixed audio (cho tín hiệu tổng)
+                let has_mixed_voice = if chunk_to_send.len() >= min_samples {
                     has_voice_activity(&chunk_to_send, VOICE_ACTIVITY_THRESHOLD, sample_rate)
                 } else {
                     false
                 };
                 
+                // 🔥 QUYẾT ĐỊNH: voice từ MIC HOẶC system HOẶC mixed
+                let has_voice = has_mic_voice || chunk_has_system_audio || has_mixed_voice;
+                
+                // 🔥 VOICE HOLD LOGIC
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                let last_voice = LAST_VOICE_TIME.load(Ordering::SeqCst);
+                let time_since_voice = now.saturating_sub(last_voice);
+                let is_in_hold_period = time_since_voice < VOICE_HOLD_TIME_MS;
+                
                 let chunk_num = chunk_counter_clone.fetch_add(1, Ordering::SeqCst);
                 let force_send = (chunk_num % FORCE_SEND_INTERVAL == 0) || (silent_chunks_count >= MAX_SILENT_CHUNKS);
                 
-                println!("📊 Chunk {}: {} samples ({:.2}s) [voice={}, force={}]", 
-                    chunk_num, chunk_to_send.len(), chunk_duration_secs,
-                    has_voice, force_send);
+                // 🔥 QUYẾT ĐỊNH CUỐI CÙNG: có voice HOẶC đang trong hold period
+                let should_process = has_voice || is_in_hold_period || force_send;
                 
-                if !has_voice && !force_send {
+                println!("📊 Chunk {}: {} samples ({:.2}s) [mic_voice={}, sys_audio={}, in_hold={}, force={}]", 
+                    chunk_num, chunk_to_send.len(), chunk_duration_secs,
+                    has_mic_voice, chunk_has_system_audio, is_in_hold_period, force_send);
+                
+                // Reset system audio flag
+                chunk_has_system_audio = false;
+                
+                if !should_process {
                     silent_chunks_count += 1;
                     println!("🔇 Silent chunk #{}, skipping", silent_chunks_count);
                     cumulative_seconds += chunk_duration_secs;
@@ -526,8 +630,12 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
                 
                 silent_chunks_count = 0;
                 
-                if has_voice {
-                    println!("🎤 Voice detected - sending chunk {}", chunk_num);
+                if has_mic_voice {
+                    println!("🎤 Mic voice detected - sending chunk {}", chunk_num);
+                } else if chunk_has_system_audio {
+                    println!("🔊 System audio detected - sending chunk {}", chunk_num);
+                } else if is_in_hold_period {
+                    println!("⏱️ Voice hold period - sending chunk {}", chunk_num);
                 } else if force_send {
                     println!("📢 Force send chunk {} (heartbeat)", chunk_num);
                 }
@@ -542,17 +650,15 @@ async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
                 current_chunk.clear();
                 last_chunk_time = std::time::Instant::now();
                 
-                // Resample về sample rate của Whisper
                 let whisper_samples = if sample_rate != WHISPER_SAMPLE_RATE {
                     resample_audio(&chunk_to_send, sample_rate, WHISPER_SAMPLE_RATE)
                 } else {
                     chunk_to_send
                 };
                 
-                println!("📤 Sending to Whisper: {} samples ({:.2}s) after resample from {}Hz to {}Hz", 
+                println!("📤 Sending to Whisper: {} samples ({:.2}s)", 
                     whisper_samples.len(), 
-                    whisper_samples.len() as f32 / WHISPER_SAMPLE_RATE as f32,
-                    sample_rate, WHISPER_SAMPLE_RATE);
+                    whisper_samples.len() as f32 / WHISPER_SAMPLE_RATE as f32);
                 
                 match tokio::time::timeout(
                     Duration::from_secs(25),

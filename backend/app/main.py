@@ -18,6 +18,7 @@ import httpx
 from groq import Groq
 import smtplib
 import asyncio
+import re
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -362,10 +363,172 @@ async def get_final_summary(ctx: RunContext) -> SummaryResponse:
         raise
 
 
+# ==================== EMAIL AGENT CLIENTS ====================
+email_groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+RESEND_API_URL = "https://api.resend.com/emails"
+
+# ==================== HÀM CHUẨN HÓA TASK FORMAT ====================
+
+
+def normalize_task_format(task_content: str, task_id: int = 0) -> str:
+    """
+    Chuẩn hóa task content về format: [Tên]: Nội dung công việc (Deadline: ASAP)
+    """
+    original_content = task_content
+
+    # Nếu đã có format [Tên]: thì giữ nguyên
+    if re.match(r"^\[.*?\]:", task_content):
+        # Kiểm tra xem đã có (Deadline: ...) chưa
+        if "(Deadline:" not in task_content:
+            task_content = f"{task_content} (Deadline: ASAP)"
+        return task_content
+
+    # Danh sách tên phổ biến
+    common_names = [
+        "Anne",
+        "John",
+        "Peter",
+        "Mary",
+        "David",
+        "Sarah",
+        "Michael",
+        "Lisa",
+        "James",
+    ]
+
+    # Thử tìm tên ở đầu câu
+    found = False
+    for name in common_names:
+        # Pattern: tên ở đầu câu (có thể có dấu cách sau)
+        pattern = re.compile(rf"^(?:{name})\s+(.+)$", re.IGNORECASE)
+        match = pattern.match(task_content)
+        if match:
+            remaining = match.group(1).strip()
+            # Xóa các từ thừa như "cần", "phải", "sẽ" ở đầu
+            remaining = re.sub(r"^(cần|phải|sẽ)\s+", "", remaining)
+            task_content = f"[{name}]: {remaining} (Deadline: ASAP)"
+            found = True
+            logger.info(
+                f"🔄 Chuẩn hóa task {task_id}: '{original_content}' -> '{task_content}'"
+            )
+            break
+
+    if not found:
+        # Không tìm thấy tên, thử format mặc định
+        task_content = f"[Người được giao]: {task_content} (Deadline: ASAP)"
+        logger.warning(
+            f"⚠️ Không tìm thấy tên trong task {task_id}: '{original_content}'"
+        )
+
+    return task_content
+
+
+def normalize_all_tasks(tasks_blocks: list) -> list:
+    """Chuẩn hóa tất cả các task blocks"""
+    normalized_blocks = []
+    for idx, block in enumerate(tasks_blocks):
+        if isinstance(block, dict):
+            content = block.get("content", "")
+            if content:
+                new_content = normalize_task_format(content, idx)
+                block["content"] = new_content
+        normalized_blocks.append(block)
+    return normalized_blocks
+
+
+# ==================== AGENT QA: KIỂM DUYỆT TASK ====================
+
+
+async def qa_verify_tasks(tasks_blocks: list, original_transcript: str) -> list:
+    """Agent QA: Kiểm duyệt xem Task có bịa đặt hay không"""
+    if not tasks_blocks:
+        return []
+
+    # Chuẩn bị danh sách task cho Agent QA đọc
+    tasks_text = "\n".join(
+        [
+            f"- ID: {i} | Nội dung: {b.get('content', '')}"
+            for i, b in enumerate(tasks_blocks)
+        ]
+    )
+
+    # Cắt ngắn transcript nếu quá dài để tránh vượt token limit
+    transcript_snippet = original_transcript[:30000]
+
+    system_prompt = """Bạn là Agent Kiểm Duyệt Chất Lượng (QA Agent) cực kỳ nghiêm khắc. 
+Nhiệm vụ của bạn là chống lại chứng "ảo giác" (hallucination) của AI khác.
+
+Quy trình:
+1. Đọc nội dung cuộc họp (Transcript).
+2. Kiểm tra danh sách Task được giao.
+3. Nếu người được giao KHÔNG CÓ TRONG CUỘC HỌP, hoặc công việc ĐÓ KHÔNG HỀ ĐƯỢC NHẮC TỚI -> Đó là task ảo (XÓA).
+4. Nếu task hợp lệ và có cơ sở từ nội dung họp -> GIỮ LẠI.
+
+CHỈ TRẢ VỀ JSON CHỨA ID CỦA NHỮNG TASK HỢP LỆ:
+{"valid_ids": [0, 2]}"""
+
+    user_prompt = f"""=== NỘI DUNG CUỘC HỌP ===\n{transcript_snippet}\n\n=== DANH SÁCH TASK CẦN KIỂM DUYỆT ===\n{tasks_text}"""
+
+    try:
+        logger.info(f"🕵️ Agent QA đang kiểm duyệt {len(tasks_blocks)} tasks...")
+
+        # Thử dùng Groq trước
+        try:
+            response = email_groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.1,
+            )
+            result = json.loads(response.choices[0].message.content)
+        except Exception as groq_error:
+            logger.warning(f"Groq QA failed ({groq_error}), using Ollama fallback...")
+            # Fallback sang Ollama
+            result_text = await call_ollama_fallback(system_prompt, user_prompt)
+            result = json.loads(result_text)
+
+        valid_ids = result.get("valid_ids", [])
+
+        # 🔥 Lọc ra những task an toàn (Xử lý an toàn cả int và str)
+        verified_tasks = []
+        for vid in valid_ids:
+            try:
+                idx = int(vid)
+                if 0 <= idx < len(tasks_blocks):
+                    verified_tasks.append(tasks_blocks[idx])
+                else:
+                    logger.warning(
+                        f"⚠️ Agent QA: ID {idx} ngoài phạm vi (0-{len(tasks_blocks)-1})"
+                    )
+            except (ValueError, TypeError):
+                logger.warning(
+                    f"⚠️ Agent QA bỏ qua ID không hợp lệ: {vid} (type: {type(vid).__name__})"
+                )
+                continue
+
+        removed_count = len(tasks_blocks) - len(verified_tasks)
+        if removed_count > 0:
+            logger.info(
+                f"✅ Agent QA đã xóa {removed_count} task ảo. Giữ lại {len(verified_tasks)} task hợp lệ."
+            )
+        else:
+            logger.info(f"✅ Agent QA xác nhận {len(verified_tasks)} task đều hợp lệ.")
+
+        return verified_tasks
+
+    except Exception as e:
+        logger.error(f"❌ Lỗi Agent QA (Bỏ qua kiểm duyệt): {e}")
+        return tasks_blocks
+
+
 async def process_and_save_summary(
-    process_id: str, all_json_data: List[str]
+    process_id: str, all_json_data: List[str], original_transcript: str = ""
 ) -> Dict[str, Any]:
-    """Process JSON chunks and save final summary to database"""
+    """Process JSON chunks, run QA Agent, and save final summary to database"""
     final_summary = {
         "MeetingName": "",
         "SectionSummary": {"title": "Section Summary", "blocks": []},
@@ -378,6 +541,7 @@ async def process_and_save_summary(
         "IndividualTasks": {"title": "Individual Tasks (Assignment)", "blocks": []},
     }
 
+    # Gom các json chunks lại
     for json_str in all_json_data:
         json_dict = json.loads(json_str)
 
@@ -408,11 +572,26 @@ async def process_and_save_summary(
             json_dict.get("IndividualTasks", {}).get("blocks", [])
         )
 
+    # 🔥 CHUẨN HÓA TASK FORMAT TRƯỚC KHI QA
+    if final_summary["IndividualTasks"]["blocks"]:
+        logger.info("📝 Đang chuẩn hóa format tasks...")
+        final_summary["IndividualTasks"]["blocks"] = normalize_all_tasks(
+            final_summary["IndividualTasks"]["blocks"]
+        )
+
+    # 👇👇👇 GỌI AGENT QA Ở ĐÂY (CHỈ KHI CÓ TRANSCRIPT) 👇👇👇
+    if original_transcript and final_summary["IndividualTasks"]["blocks"]:
+        raw_tasks = final_summary["IndividualTasks"]["blocks"]
+        verified_tasks = await qa_verify_tasks(raw_tasks, original_transcript)
+        final_summary["IndividualTasks"]["blocks"] = verified_tasks
+
     if final_summary["MeetingName"]:
         await processor.db.update_meeting_name(process_id, final_summary["MeetingName"])
 
     await processor.db.update_process(
-        process_id, status="completed", result=json.dumps(final_summary)
+        process_id,
+        status="completed",
+        result=json.dumps(final_summary, ensure_ascii=False),
     )
 
     return final_summary
@@ -436,8 +615,8 @@ async def process_transcript_background(process_id: str, transcript: TranscriptR
             overlap=transcript.overlap,
         )
 
-        # Save summary to database
-        await process_and_save_summary(process_id, all_json_data)
+        # Save summary to database (có QA Agent và chuẩn hóa format)
+        await process_and_save_summary(process_id, all_json_data, transcript.text)
 
         # Cập nhật thống kê thành công
         total_duration = time.time() - start_time
@@ -495,8 +674,10 @@ async def process_transcript_background(process_id: str, transcript: TranscriptR
                         overlap=fallback_transcript.overlap,
                     )
 
-                    # LƯU KẾT QUẢ FALLBACK VÀO DATABASE
-                    await process_and_save_summary(process_id, all_json_data)
+                    # LƯU KẾT QUẢ FALLBACK VÀO DATABASE (có QA Agent và chuẩn hóa)
+                    await process_and_save_summary(
+                        process_id, all_json_data, transcript.text
+                    )
 
                     # Cập nhật thống kê cho fallback model
                     fallback_duration = time.time() - fallback_start_time
@@ -509,11 +690,10 @@ async def process_transcript_background(process_id: str, transcript: TranscriptR
                     logger.info(
                         f"✅ Fallback processing successful for process {process_id}"
                     )
-                    return  # Thoát thành công
+                    return
 
                 except Exception as fallback_error:
                     logger.error(f"❌ Fallback also failed: {str(fallback_error)}")
-                    # Cập nhật thống kê thất bại cho fallback
                     model_manager.update_stats(
                         fallback_info["key"],
                         success=False,
@@ -838,16 +1018,14 @@ COMPANY_CONTEXT_FILE = os.path.join(os.path.dirname(__file__), "company_context.
 # Đảm bảo file tồn tại
 if not os.path.exists(COMPANY_CONTEXT_FILE):
     with open(COMPANY_CONTEXT_FILE, "w", encoding="utf-8") as f:
-        f.write(
-            """Tên công ty: Meetily Corporation
+        f.write("""Tên công ty: Meetily Corporation
 Người gửi: Thế Anh
 Chức danh: Giám đốc Điều hành (CEO)
 Email người gửi: ceo@meetily.com
 Giọng văn: Chuyên nghiệp, thân thiện, rõ ràng, dễ hiểu
 Lĩnh vực: Cung cấp giải pháp phần mềm AI và tự động hóa doanh nghiệp
 Thông điệp: Đồng hành cùng sự phát triển của đối tác
-Chữ ký mặc định: Trân trọng,"""
-        )
+Chữ ký mặc định: Trân trọng,""")
 
 
 class UpdateContextRequest(BaseModel):
@@ -894,10 +1072,90 @@ async def download_company_context():
         return {"success": False, "error": str(e)}
 
 
-# ==================== EMAIL AGENT ENDPOINTS ====================
+# ==================== MEETING HISTORY ENDPOINTS ====================
 
-# Khởi tạo Groq client cho Email Agent
-email_groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+@app.get("/meetings")
+async def get_all_meetings(limit: int = 5, offset: int = 0):
+    """API lấy danh sách lịch sử cuộc họp cho Sidebar"""
+    try:
+        meetings = await processor.db.get_all_meetings(limit, offset)
+        return JSONResponse(
+            {"status": "success", "meetings": meetings, "total": len(meetings)}
+        )
+    except Exception as e:
+        logger.error(f"Lỗi khi lấy danh sách cuộc họp: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "error": str(e), "meetings": []},
+        )
+
+
+@app.delete("/meetings/{process_id}")
+async def delete_meeting(process_id: str):
+    """API xóa một cuộc họp"""
+    try:
+        success = await processor.db.delete_meeting(process_id)
+        if success:
+            return JSONResponse(
+                {"status": "success", "message": "Đã xóa cuộc họp thành công"}
+            )
+        else:
+            return JSONResponse(
+                status_code=404,
+                content={"status": "error", "error": "Không tìm thấy cuộc họp"},
+            )
+    except Exception as e:
+        logger.error(f"Lỗi khi xóa cuộc họp {process_id}: {e}")
+        return JSONResponse(
+            status_code=500, content={"status": "error", "error": str(e)}
+        )
+
+
+@app.get("/meetings/{process_id}/detail")
+async def get_meeting_detail(process_id: str):
+    """API lấy chi tiết một cuộc họp (bao gồm cả transcript và summary)"""
+    try:
+        result = await processor.db.get_transcript_data(process_id)
+        if not result:
+            return JSONResponse(
+                status_code=404,
+                content={"status": "error", "error": "Không tìm thấy cuộc họp"},
+            )
+
+        # Parse result JSON nếu có
+        summary_data = None
+        if result.get("result"):
+            try:
+                summary_data = json.loads(result["result"])
+                if isinstance(summary_data, str):
+                    summary_data = json.loads(summary_data)
+            except json.JSONDecodeError:
+                summary_data = None
+
+        return JSONResponse(
+            {
+                "status": "success",
+                "process_id": process_id,
+                "meeting_name": result.get("meeting_name", "Cuộc họp chưa đặt tên"),
+                "transcript": result.get("transcript_text", ""),
+                "summary": summary_data,
+                "status": result.get("status", "unknown"),
+                "created_at": result.get("created_at"),
+                "start_time": result.get("start_time"),
+                "end_time": result.get("end_time"),
+                "model": result.get("model"),
+                "model_name": result.get("model_name"),
+            }
+        )
+    except Exception as e:
+        logger.error(f"Lỗi khi lấy chi tiết cuộc họp {process_id}: {e}")
+        return JSONResponse(
+            status_code=500, content={"status": "error", "error": str(e)}
+        )
+
+
+# ==================== EMAIL AGENT ENDPOINTS ====================
 
 # Đọc config từ environment variables
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
@@ -968,6 +1226,11 @@ async def call_ollama_fallback(system_prompt: str, user_prompt: str) -> str:
 async def generate_drafts(
     meeting_summary: str, users_tasks: list, context_text: str = ""
 ):
+    """
+    Tạo email bằng 2 Agent:
+    - Agent 1 (Thư ký): Soạn bản nháp tự do
+    - Agent 2 (Trưởng phòng): Kiểm duyệt, sửa lỗi, đóng gói JSON
+    """
     drafts = []
 
     # Lấy context từ file
@@ -976,27 +1239,9 @@ async def generate_drafts(
         file_context if file_context and file_context.strip() else context_text
     )
 
-    system_prompt = f"""Bạn là AI Email Agent chuyên nghiệp. Soạn email giao việc với đầy đủ 3 phần:
-
-1. GIỚI THIỆU NGƯỜI VIẾT: Dựa vào context bên dưới
-2. TÓM TẮT CUỘC HỌP: Nêu ngắn gọn nội dung chính
-3. GIAO VIỆC CỤ THỂ: Liệt kê rõ ràng các task
-
-=== THÔNG TIN CÔNG TY & NGƯỜI VIẾT ===
-{final_context}
-
-=== TÓM TẮT NỘI DUNG CUỘC HỌP ===
-{meeting_summary}
-
-YÊU CẦU:
-- Email phải có đủ 3 phần: Giới thiệu + Tóm tắt cuộc họp + Giao việc
-- Ký tên đầy đủ: [Tên], [Chức danh], [Tên công ty]
-- Giọng văn chuyên nghiệp, lịch sự
-- Chỉ trả về JSON format: {{"subject": "tiêu đề", "body": "nội dung email"}}"""
-
     for user in users_tasks:
         tasks_list = []
-        for t in user["tasks"]:
+        for t in user.get("tasks", []):
             deadline_text = (
                 f" (Hạn: {t['deadline']})"
                 if t.get("deadline") and t["deadline"] != "ASAP"
@@ -1005,100 +1250,118 @@ YÊU CẦU:
             tasks_list.append(f"  • {t['task_name']}{deadline_text}")
 
         tasks_text = "\n".join(tasks_list)
-
-        user_prompt = f"""Viết email cho: {user['name']} ({user['email']})
-
-CÔNG VIỆC ĐƯỢC GIAO CHO {user['name'].upper()}:
-{tasks_text}
-
-YÊU CẦU:
-1. Mở đầu: Giới thiệu bản thân theo context công ty
-2. Thân bài: Tóm tắt ngắn gọn nội dung cuộc họp (1-2 câu)
-3. Phần chính: Trình bày rõ ràng các task được giao
-4. Kết thúc: Khuyến khích, động viên và ký tên đầy đủ
-
-Viết bằng tiếng Việt, giọng văn thân thiện nhưng chuyên nghiệp."""
-
         result_text = ""
 
-        # Thử gọi API của Groq trước
         try:
-            response = email_groq_client.chat.completions.create(
+            # =========================================================
+            # AGENT 1: THƯ KÝ (THE WRITER) - Soạn bản nháp tự do
+            # =========================================================
+            writer_sys_prompt = f"""Bạn là Thư ký AI chuyên nghiệp. Hãy soạn bản nháp email giao việc cho nhân viên.
+THÔNG TIN NGƯỜI GỬI:
+{final_context}
+
+TÓM TẮT CUỘC HỌP (Dùng để viết lời dẫn):
+{meeting_summary}"""
+
+            writer_user_prompt = f"""Hãy viết một email hoàn chỉnh cho: {user.get('name', 'Nhân viên')} ({user.get('email', 'email@example.com')}).
+NỘI DUNG CÔNG VIỆC CẦN GIAO:
+{tasks_text}
+
+Viết bằng tiếng Việt, thân thiện và chuyên nghiệp. KHÔNG CẦN FORMAT JSON ở bước này."""
+
+            logger.info(
+                f"✍️ [Agent 1] Thư ký đang soạn nháp email cho {user.get('name', 'Nhân viên')}..."
+            )
+            writer_res = email_groq_client.chat.completions.create(
                 model=GROQ_MODEL,
                 messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
+                    {"role": "system", "content": writer_sys_prompt},
+                    {"role": "user", "content": writer_user_prompt},
                 ],
-                response_format={"type": "json_object"},
-                temperature=GROQ_TEMPERATURE,
+                temperature=0.7,
                 max_tokens=GROQ_MAX_TOKENS,
             )
-            result_text = response.choices[0].message.content
+            draft_content = writer_res.choices[0].message.content
+
+            # =========================================================
+            # AGENT 2: TRƯỞNG PHÒNG (THE EDITOR) - Kiểm duyệt & Sửa lỗi
+            # =========================================================
+            editor_sys_prompt = """Bạn là Trưởng phòng Kiểm duyệt Email. Nhiệm vụ của bạn là đọc bản nháp của Thư ký, SỬA LỖI và trả về kết quả cuối cùng.
+CHECKLIST KIỂM DUYỆT BẮT BUỘC:
+1. Có đủ 3 phần: Mở bài (Chào hỏi) - Thân bài (Giao task) - Kết bài (Ký tên) chưa?
+2. So sánh với TASK GỐC: Thư ký có bịa thêm công việc hay tự chế thêm Deadline không? NẾU CÓ, HÃY XÓA NGAY LẬP TỨC!
+3. Chữ ký ở cuối email đã đúng với Thông tin người gửi chưa?
+
+Sau khi sửa xong, CHỈ ĐƯỢC PHÉP TRẢ VỀ ĐÚNG FORMAT JSON SAU:
+{"subject": "Tiêu đề email", "body": "Nội dung email đã được duyệt chuẩn xác"}"""
+
+            editor_user_prompt = f"""=== DANH SÁCH TASK GỐC (Làm chuẩn để đối chiếu) ===
+{tasks_text}
+
+=== BẢN NHÁP DO THƯ KÝ VIẾT ===
+{draft_content}
+
+Hãy kiểm duyệt, sửa đổi nếu vi phạm checklist và trả về JSON."""
+
             logger.info(
-                f"✅ Đã tạo email cho {user['name']} bằng GROQ API ({GROQ_MODEL})"
+                f"🧐 [Agent 2] Trưởng phòng đang soi lỗi và chốt email cho {user.get('name', 'Nhân viên')}..."
+            )
+            editor_res = email_groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {"role": "system", "content": editor_sys_prompt},
+                    {"role": "user", "content": editor_user_prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.1,
+                max_tokens=GROQ_MAX_TOKENS,
+            )
+            result_text = editor_res.choices[0].message.content
+            logger.info(
+                f"✅ Đã chốt xong email cho {user.get('name', 'Nhân viên')} qua 2 vòng Agent."
             )
 
         except Exception as groq_error:
             logger.warning(
-                f"⚠️ Groq lỗi ({groq_error}). Chuyển sang dùng OLLAMA LOCAL cho {user['name']}..."
+                f"⚠️ Lỗi luồng 2 Agents ({groq_error}). Chuyển sang Ollama Local..."
             )
-
-            # Nếu Groq lỗi, gọi hàm Backup Ollama
+            # Fallback nếu Groq sập
             try:
-                result_text = await call_ollama_fallback(system_prompt, user_prompt)
-                logger.info(
-                    f"✅ Đã tạo email cho {user['name']} bằng OLLAMA LOCAL ({OLLAMA_MODEL})"
+                fallback_prompt = f"Viết email giao việc bằng JSON. Task: {tasks_text}"
+                result_text = await call_ollama_fallback(
+                    "Chỉ trả về JSON format: {'subject': '...', 'body': '...'}",
+                    fallback_prompt,
                 )
             except Exception as ollama_error:
-                logger.error(
-                    f"❌ Lỗi cả Groq và Ollama cho {user['name']}: {ollama_error}"
-                )
-                # Thêm draft mặc định nếu cả 2 đều sập
+                logger.error(f"❌ Lỗi cả Groq và Ollama: {ollama_error}")
                 result_text = json.dumps(
                     {
-                        "subject": f"Cập nhật công việc từ cuộc họp - {user['name']}",
-                        "body": f"""Kính gửi anh/chị {user['name']},
-
-{final_context.split(chr(10))[0] if 'Tên công ty:' in final_context else 'Công ty chúng tôi'} xin gửi đến anh/chị những công việc cần thực hiện sau cuộc họp hôm nay:
-
-**Công việc được giao:**
-{tasks_text}
-
-Rất mong anh/chị hoàn thành đúng thời hạn.
-
-{final_context.split(chr(10))[2] if 'Chức danh:' in final_context else 'Trân trọng,'}
-{final_context.split(chr(10))[1] if 'Người gửi:' in final_context else 'Ban Giám Đốc'}""",
+                        "subject": f"Cập nhật công việc - {user.get('name', 'Nhân viên')}",
+                        "body": f"Kính gửi {user.get('name', 'Nhân viên')},\n\nDanh sách công việc:\n{tasks_text}\n\nTrân trọng,\n{final_context.split(chr(10))[1] if 'Người gửi:' in final_context else 'Ban Giám Đốc'}",
                     }
                 )
 
-        # Parse JSON và thêm vào danh sách
+        # =========================================================
+        # PARSE KẾT QUẢ VÀ TRẢ VỀ FRONTEND
+        # =========================================================
         try:
             result = json.loads(result_text)
             drafts.append(
                 {
-                    "to_email": user["email"],
-                    "to_name": user["name"],
+                    "to_email": user.get("email", ""),
+                    "to_name": user.get("name", ""),
                     "subject": result.get("subject", "Cập nhật công việc từ cuộc họp"),
-                    "body": result.get("body", "Nội dung trống do lỗi parse."),
+                    "body": result.get("body", "Nội dung email trống do lỗi xử lý."),
                 }
             )
         except json.JSONDecodeError as e:
-            logger.error(f"❌ Lỗi parse JSON cho {user['name']}: {e}")
-            logger.error(f"Raw response: {result_text[:500]}")
-            # Fallback draft nếu parse lỗi
+            logger.error(f"❌ Lỗi parse JSON: {e}")
             drafts.append(
                 {
-                    "to_email": user["email"],
-                    "to_name": user["name"],
-                    "subject": f"Cập nhật công việc - {user['name']}",
-                    "body": f"""Kính gửi anh/chị {user['name']},
-
-Sau cuộc họp hôm nay, xin gửi đến anh/chị các công việc cần thực hiện:
-
-{tasks_text}
-
-Trân trọng,
-Ban Giám Đốc""",
+                    "to_email": user.get("email", ""),
+                    "to_name": user.get("name", ""),
+                    "subject": f"Cập nhật công việc - {user.get('name', 'Nhân viên')}",
+                    "body": f"Kính gửi {user.get('name', 'Nhân viên')},\n\nDanh sách công việc:\n{tasks_text}\n\nTrân trọng,\n{final_context.split(chr(10))[1] if 'Người gửi:' in final_context else 'Ban Giám Đốc'}",
                 }
             )
 
@@ -1114,25 +1377,19 @@ async def send_single_email(draft: dict):
         return {"status": "error", "error": "Missing Gmail config in .env"}
 
     def _send_email_sync():
-        # Tạo cấu trúc email
         msg = MIMEMultipart()
         msg["From"] = f"Meetily AI <{GMAIL_USER}>"
         msg["To"] = draft["to_email"]
         msg["Subject"] = draft["subject"]
-
-        # Đính kèm nội dung email (text thuần, hỗ trợ tiếng Việt)
         msg.attach(MIMEText(draft["body"], "plain", "utf-8"))
 
         logger.info(f"📧 Đang kết nối tới Gmail để gửi cho {draft['to_email']}...")
 
-        # Kết nối an toàn qua cổng SSL của Google
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            # server.set_debuglevel(1)  # Bỏ comment nếu muốn xem log chi tiết
             server.login(GMAIL_USER, GMAIL_APP_PASSWORD.replace(" ", ""))
             server.send_message(msg)
 
     try:
-        # Chạy I/O gửi mail trong một luồng (thread) riêng để không làm treo Backend
         await asyncio.to_thread(_send_email_sync)
         logger.info(f"✅ Đã gửi email thành công tới {draft['to_email']}")
         return {"status": "success"}
@@ -1149,6 +1406,7 @@ async def send_emails_background_task(drafts: list):
 
 @app.post("/generate-email-drafts")
 async def api_generate_drafts(req: GenerateEmailRequest):
+    """Tạo email draft với 2 Agent (Thư ký + Trưởng phòng)"""
     try:
         drafts = await generate_drafts(
             req.meeting_summary, req.users_tasks, req.context_text
@@ -1161,6 +1419,7 @@ async def api_generate_drafts(req: GenerateEmailRequest):
 
 @app.post("/send-emails")
 async def api_send_emails(req: SendEmailsRequest, background_tasks: BackgroundTasks):
+    """Gửi email đã được duyệt"""
     try:
         background_tasks.add_task(send_emails_background_task, req.drafts)
         return {"success": True}

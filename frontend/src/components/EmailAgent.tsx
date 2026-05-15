@@ -246,13 +246,6 @@ export default function EmailAgent({
           ))}
         </div>
       )}
-
-      {/* Chế độ test mode indicator */}
-      {process.env.NODE_ENV === 'development' && !drafts.length && tasks.length > 0 && (
-        <div className="mt-3 text-xs text-gray-400 text-center">
-          💡 Tip: Để gửi email thật, cấu hình RESEND_API_KEY trong file .env của backend
-        </div>
-      )}
     </div>
   );
 }
