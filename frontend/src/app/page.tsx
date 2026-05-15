@@ -24,6 +24,7 @@ import { SpeakerModal } from '@/components/Meeting/Modals/SpeakerModal';
 import { ModelSettingsModal } from '@/components/Meeting/Modals/ModelSettingsModal';
 import { formatTimeFromSeconds } from '@/utils/transcriptUtils';
 import CompanyContextManager from '@/components/CompanyContextManager';
+import { ContributionChart } from '@/components/Meeting/Charts/ContributionChart';
 
 interface TranscriptUpdate {
   text: string;
@@ -591,57 +592,61 @@ export default function Home() {
   };
 
   const generateAISummary = useCallback(async () => {
-    setSummaryStatus('processing');
-    setSummaryError(null);
-    try {
-      const fullTranscript = [...transcripts]
-        .sort((a, b) => a.t0 - b.t0)
-        .map(t => {
-          const speakerName = getSpeakerDisplayName(t.speaker || 'UNKNOWN');
-          return `[${speakerName}] ${formatTimeFromSeconds(t.t0)} - ${formatTimeFromSeconds(t.t1)}: ${t.text}`;
-        })
-        .join('\n');
-      if (!fullTranscript.trim()) throw new Error('No transcript text available.');
-      setOriginalTranscript(fullTranscript);
-      const response = await fetch('http://localhost:5167/process-transcript', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          text: fullTranscript,
-          model: modelConfig.provider,
-          model_name: modelConfig.model,
-          chunk_size: 20000,
-          overlap: 1000
-        })
-      });
-      if (!response.ok) throw new Error('Failed to process transcript');
-      const { process_id } = await response.json();
-      const pollInterval = setInterval(async () => {
-        try {
-          const statusResponse = await fetch(`http://localhost:5167/get-summary/${process_id}`);
-          if (!statusResponse.ok) throw new Error('Failed to get summary');
-          const result = await statusResponse.json();
-          if (result.status === 'error') {
-            setSummaryError(result.error);
-            setSummaryStatus('error');
-            clearInterval(pollInterval);
-          } else if (result.status === 'completed' && result.data) {
-            clearInterval(pollInterval);
-            const { MeetingName, ...summaryData } = result.data;
-            if (MeetingName) setMeetingTitle(MeetingName);
-            setAiSummary({ MeetingName, ...summaryData });
-            setSummaryStatus('completed');
-          }
-        } catch (err) {
-          clearInterval(pollInterval);
+  setSummaryStatus('processing');
+  setSummaryError(null);
+  try {
+    const fullTranscript = [...transcripts]
+      .sort((a, b) => a.t0 - b.t0)
+      .map(t => {
+        const speakerName = getSpeakerDisplayName(t.speaker || 'UNKNOWN');
+        return `[${speakerName}] ${formatTimeFromSeconds(t.t0)} - ${formatTimeFromSeconds(t.t1)}: ${t.text}`;
+      })
+      .join('\n');
+    if (!fullTranscript.trim()) throw new Error('No transcript text available.');
+    setOriginalTranscript(fullTranscript);
+    
+    console.log("🎵 Sending audio_file_path:", lastAudioFile);
+    
+    const response = await fetch('http://localhost:5167/process-transcript', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        text: fullTranscript,
+        model: modelConfig.provider,
+        model_name: modelConfig.model,
+        chunk_size: 20000,
+        overlap: 1000,
+        audio_file_path: lastAudioFile
+      })
+    });
+    if (!response.ok) throw new Error('Failed to process transcript');
+    const { process_id } = await response.json();
+    const pollInterval = setInterval(async () => {
+      try {
+        const statusResponse = await fetch(`http://localhost:5167/get-summary/${process_id}`);
+        if (!statusResponse.ok) throw new Error('Failed to get summary');
+        const result = await statusResponse.json();
+        if (result.status === 'error') {
+          setSummaryError(result.error);
           setSummaryStatus('error');
+          clearInterval(pollInterval);
+        } else if (result.status === 'completed' && result.data) {
+          clearInterval(pollInterval);
+          const { MeetingName, ...summaryData } = result.data;
+          if (MeetingName) setMeetingTitle(MeetingName);
+          setAiSummary({ MeetingName, ...summaryData });
+          setSummaryStatus('completed');
         }
-      }, 5000);
-      return () => clearInterval(pollInterval);
-    } catch (err) {
-      setSummaryStatus('error');
-    }
-  }, [transcripts, modelConfig, getSpeakerDisplayName]);
+      } catch (err) {
+        clearInterval(pollInterval);
+        setSummaryStatus('error');
+      }
+    }, 5000);
+    return () => clearInterval(pollInterval);
+  } catch (err) {
+    setSummaryStatus('error');
+  }
+}, [transcripts, modelConfig, getSpeakerDisplayName, lastAudioFile]);
 
   const handleRegenerateSummary = useCallback(async () => {
     if (!originalTranscript.trim()) return;
@@ -988,6 +993,31 @@ export default function Home() {
                   <h1 className="text-2xl font-bold text-gray-800 mb-6 pb-2 border-b">
                     {aiSummary.MeetingName}
                   </h1>
+                )}
+                {meetingId && meetingId.length > 30 && !isLoadingMeeting && (
+                  <div className="mb-6 p-4 bg-gray-50 rounded-xl border border-gray-200 shadow-sm">
+                    <h3 className="text-sm font-semibold text-gray-700 flex items-center gap-2 mb-2">
+                      🎧 Nghe lại bản ghi âm gốc
+                    </h3>
+                    <audio 
+                      controls 
+                      className="w-full"
+                      src={`http://localhost:5167/audio/${meetingId}`}
+                      preload="metadata"
+                    >
+                      Trình duyệt của bạn không hỗ trợ phát âm thanh.
+                    </audio>
+                    <p className="text-xs text-gray-400 mt-2">
+                      ⏱️ Toàn bộ nội dung cuộc họp đã được ghi âm
+                    </p>
+                  </div>
+                )}
+
+                {/* 📊 CONTRIBUTION CHART - THÊM VÀO ĐÂY */}
+                {meetingId && meetingId.length > 30 && (
+                  <div className="mb-6">
+                    <ContributionChart processId={meetingId} />
+                  </div>
                 )}
 
                 {/* RENDER CÁC SECTION */}
