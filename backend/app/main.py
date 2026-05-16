@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, FileResponse
 from pydantic import BaseModel
 import uvicorn
 from typing import Optional, Dict, Any, List
@@ -120,6 +120,7 @@ class TranscriptRequest(BaseModel):
     model_name: str
     chunk_size: Optional[int] = 20000
     overlap: Optional[int] = 1000
+    audio_file_path: Optional[str] = None
 
 
 class MappingRequest(BaseModel):
@@ -599,6 +600,29 @@ async def process_transcript_background(process_id: str, transcript: TranscriptR
             current_model_key, success=True, response_time=total_duration
         )
         logger.info(f"Background processing completed for process_id: {process_id}")
+
+        # ==================== GIẢI PHÓNG BỘ NHỚ SAU KHI XỬ LÝ ====================
+        import gc
+        import torch
+
+        # Xóa tham chiếu đến các model trong processor nếu có
+        if hasattr(processor, "transcript_processor"):
+            if hasattr(processor.transcript_processor, "model"):
+                del processor.transcript_processor.model
+            if hasattr(processor.transcript_processor, "diarization_pipeline"):
+                del processor.transcript_processor.diarization_pipeline
+
+        # Gọi garbage collector
+        gc.collect()
+
+        # Giải phóng bộ nhớ cache trên GPU Metal
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+            logger.info("✅ Đã giải phóng bộ nhớ MPS cache")
+
+        logger.info(f"📊 Memory cleanup completed for process_id: {process_id}")
+        # ====================================================================
+
     except Exception as e:
         error_msg = str(e)
         total_duration = time.time() - start_time
@@ -619,6 +643,16 @@ async def process_transcript_api(
     """Process a transcript text with background processing"""
     try:
         process_id = await processor.db.create_process()
+
+        # ✅ THÊM ĐOẠN NÀY ĐỂ LƯU AUDIO PATH VÀO DB
+        if transcript.audio_file_path:
+            await processor.db.update_audio_file_path(
+                process_id, transcript.audio_file_path
+            )
+            logger.info(
+                f"✅ Đã lưu audio path cho process {process_id}: {transcript.audio_file_path}"
+            )
+
         await processor.db.save_transcript(
             process_id,
             transcript.text,
@@ -1042,8 +1076,6 @@ async def get_all_email_logs(limit: int = 50):
 
 # ==================== EMAIL AGENT ENDPOINTS ====================
 
-# ==================== EMAIL AGENT ENDPOINTS ====================
-
 # Đọc config từ environment variables
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct")
@@ -1286,6 +1318,184 @@ async def api_send_emails(req: SendEmailsRequest, background_tasks: BackgroundTa
     except Exception as e:
         logger.error(f"Lỗi API gửi email: {e}")
         return {"success": False, "error": str(e)}
+
+
+# ==================== AUDIO STREAMING ENDPOINT ====================
+@app.get("/audio/{process_id}")
+async def get_audio_file(process_id: str):
+    """API để phát lại file ghi âm của một cuộc họp cũ"""
+    try:
+        # 1. Lấy đường dẫn file từ DB
+        audio_path = await processor.db.get_audio_file_path(process_id)
+
+        # 2. Kiểm tra DB có lưu path không và file có tồn tại trên ổ cứng không
+        if audio_path and os.path.exists(audio_path):
+            logger.info(f"🎵 Đang stream file audio: {audio_path}")
+            return FileResponse(
+                path=audio_path,
+                media_type="audio/wav",
+                filename=f"recording_{process_id}.wav",
+            )
+        else:
+            logger.warning(f"⚠️ Không tìm thấy file audio cho process_id: {process_id}")
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": "Không tìm thấy file âm thanh hoặc file đã bị xóa",
+                    "status": "error",
+                },
+            )
+    except Exception as e:
+        logger.error(f"❌ Lỗi khi phát audio: {e}")
+        return JSONResponse(
+            status_code=500, content={"error": str(e), "status": "error"}
+        )
+
+
+# ==================== SPEAKER CONTRIBUTION ENDPOINTS ====================
+@app.get("/analyze-contributions/{process_id}")
+async def analyze_contributions(process_id: str):
+    """Phân tích mức độ đóng góp của các thành viên trong cuộc họp"""
+    try:
+        # 1. Lấy transcript từ database
+        result = await processor.db.get_transcript_data(process_id)
+        if not result or not result.get("transcript_text"):
+            return JSONResponse(
+                status_code=404,
+                content={"error": "Không tìm thấy transcript", "status": "error"},
+            )
+
+        transcript = result["transcript_text"]
+
+        # 2. Gọi Groq API để phân tích
+        contributions = await analyze_speaker_contributions(transcript)
+
+        # 3. Lưu kết quả vào database
+        await processor.db.save_speaker_contributions(process_id, contributions)
+
+        return JSONResponse({"status": "success", "contributions": contributions})
+
+    except Exception as e:
+        logger.error(f"Lỗi phân tích đóng góp: {e}")
+        return JSONResponse(
+            status_code=500, content={"error": str(e), "status": "error"}
+        )
+
+
+@app.get("/get-contributions/{process_id}")
+async def get_contributions(process_id: str):
+    """Lấy phân tích đóng góp đã lưu từ database"""
+    try:
+        contributions = await processor.db.get_speaker_contributions(process_id)
+        return JSONResponse({"status": "success", "contributions": contributions})
+    except Exception as e:
+        logger.error(f"Lỗi lấy contributions: {e}")
+        return JSONResponse(
+            status_code=500, content={"error": str(e), "status": "error"}
+        )
+
+
+async def analyze_speaker_contributions(transcript: str) -> List[Dict[str, Any]]:
+    """Gọi AI để phân tích mức độ đóng góp của từng người nói"""
+
+    prompt = f"""Phân tích đoạn hội thoại sau và tính toán phần trăm đóng góp của mỗi người nói.
+
+Quy tắc tính phần trăm đóng góp dựa trên:
+1. Số lượng câu nói (40% trọng số)
+2. Độ dài trung bình mỗi câu (30% trọng số)  
+3. Mức độ tương tác (được người khác phản hồi) (30% trọng số)
+
+Transcript:
+{transcript[:8000]}
+
+CHỈ TRẢ VỀ JSON, không giải thích thêm. Format:
+{{
+    "speakers": [
+        {{"name": "Tên người 1", "contribution": 45, "talk_time": 120.5, "sentence_count": 15}},
+        {{"name": "Tên người 2", "contribution": 35, "talk_time": 95.2, "sentence_count": 12}}
+    ]
+}}
+
+Tổng các contribution phải bằng 100%."""
+
+    try:
+        response = email_groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Bạn là chuyên gia phân tích dữ liệu cuộc họp. Chỉ trả về JSON hợp lệ.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.3,
+        )
+
+        result = json.loads(response.choices[0].message.content)
+        speakers = result.get("speakers", [])
+
+        # Đảm bảo tổng contribution = 100%
+        total = sum(s.get("contribution", 0) for s in speakers)
+        if total > 0 and total != 100:
+            for s in speakers:
+                s["contribution"] = round(s["contribution"] * 100 / total, 1)
+
+        return speakers
+
+    except Exception as e:
+        logger.error(f"Lỗi gọi AI phân tích: {e}")
+        # Trả về phân tích cơ bản từ transcript
+        return await basic_analysis(transcript)
+
+
+async def basic_analysis(transcript: str) -> List[Dict[str, Any]]:
+    """Phân tích cơ bản khi AI không hoạt động"""
+    lines = transcript.split("\n")
+    speaker_stats = {}
+
+    for line in lines:
+        match = re.match(r"\[(.*?)\]\s*[\d:]+\s*-\s*[\d:]+:\s*(.*)", line)
+        if match:
+            speaker = match.group(1)
+            text = match.group(2)
+
+            if speaker not in speaker_stats:
+                speaker_stats[speaker] = {"sentence_count": 0, "total_length": 0}
+
+            speaker_stats[speaker]["sentence_count"] += 1
+            speaker_stats[speaker]["total_length"] += len(text)
+
+    # Tính phần trăm dựa trên số câu
+    total_sentences = sum(s["sentence_count"] for s in speaker_stats.values())
+
+    contributions = []
+    for speaker, stats in speaker_stats.items():
+        contribution = (
+            round(stats["sentence_count"] * 100 / total_sentences, 1)
+            if total_sentences > 0
+            else 0
+        )
+        avg_length = (
+            stats["total_length"] / stats["sentence_count"]
+            if stats["sentence_count"] > 0
+            else 0
+        )
+        talk_time = stats["sentence_count"] * 5  # ước lượng ~5 giây/câu
+
+        contributions.append(
+            {
+                "name": speaker,
+                "contribution": contribution,
+                "talk_time": talk_time,
+                "sentence_count": stats["sentence_count"],
+                "avg_length": round(avg_length, 1),
+            }
+        )
+
+    # Sắp xếp theo contribution giảm dần
+    contributions.sort(key=lambda x: x["contribution"], reverse=True)
+    return contributions
 
 
 # ==================== MAIN ====================

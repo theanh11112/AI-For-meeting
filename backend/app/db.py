@@ -33,7 +33,8 @@ class DatabaseManager:
                     end_time TEXT,
                     chunk_count INTEGER DEFAULT 0,
                     processing_time REAL DEFAULT 0.0,
-                    metadata TEXT
+                    metadata TEXT,
+                    audio_file_path TEXT
                 )
             """)
             cursor.execute("""
@@ -63,6 +64,21 @@ class DatabaseManager:
                     status TEXT DEFAULT 'success',
                     error_message TEXT,
                     FOREIGN KEY (process_id) REFERENCES summary_processes(id)
+                )
+            """)
+
+            # 🔥 BẢNG SPEAKER CONTRIBUTIONS (cho biểu đồ đóng góp)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS speaker_contributions (
+                    id TEXT PRIMARY KEY,
+                    process_id TEXT NOT NULL,
+                    speaker_name TEXT NOT NULL,
+                    contribution_percent REAL DEFAULT 0,
+                    talk_time_seconds REAL DEFAULT 0,
+                    sentence_count INTEGER DEFAULT 0,
+                    analyzed_at TEXT NOT NULL,
+                    FOREIGN KEY (process_id) REFERENCES summary_processes(id),
+                    UNIQUE(process_id, speaker_name)
                 )
             """)
 
@@ -100,6 +116,7 @@ class DatabaseManager:
         chunk_count: Optional[int] = None,
         processing_time: Optional[float] = None,
         metadata: Optional[Dict] = None,
+        audio_file_path: Optional[str] = None,
     ):
         """Update a process status and result"""
         now = datetime.utcnow().isoformat()
@@ -123,6 +140,9 @@ class DatabaseManager:
             if metadata:
                 update_fields.append("metadata = ?")
                 params.append(json.dumps(metadata))
+            if audio_file_path:
+                update_fields.append("audio_file_path = ?")
+                params.append(audio_file_path)
             if status == "completed" or status == "failed":
                 update_fields.append("end_time = ?")
                 params.append(now)
@@ -138,7 +158,7 @@ class DatabaseManager:
         """Get a process by its ID"""
         async with self._get_connection() as conn:
             async with conn.execute(
-                "SELECT id, status, created_at, updated_at, result, error, start_time, end_time, chunk_count, processing_time, metadata FROM summary_processes WHERE id = ?",
+                "SELECT id, status, created_at, updated_at, result, error, start_time, end_time, chunk_count, processing_time, metadata, audio_file_path FROM summary_processes WHERE id = ?",
                 (process_id,),
             ) as cursor:
                 row = await cursor.fetchone()
@@ -155,6 +175,7 @@ class DatabaseManager:
                     "end_time": row[7],
                     "chunk_count": row[8],
                     "processing_time": row[9],
+                    "audio_file_path": row[11],
                 }
 
                 if row[4]:  # result
@@ -206,12 +227,35 @@ class DatabaseManager:
             )
             await conn.commit()
 
+    async def update_audio_file_path(self, process_id: str, audio_file_path: str):
+        """Update audio file path for a process"""
+        async with self._get_connection() as conn:
+            await conn.execute(
+                """
+                UPDATE summary_processes SET audio_file_path = ? WHERE id = ?
+            """,
+                (audio_file_path, process_id),
+            )
+            await conn.commit()
+
+    async def get_audio_file_path(self, process_id: str) -> Optional[str]:
+        """Get audio file path for a process"""
+        async with self._get_connection() as conn:
+            async with conn.execute(
+                "SELECT audio_file_path FROM summary_processes WHERE id = ?",
+                (process_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    return row[0]
+                return None
+
     async def get_transcript_data(self, process_id: str):
         """Get transcript data for a process"""
         async with self._get_connection() as conn:
             async with conn.execute(
                 """
-                SELECT t.*, p.status, p.result 
+                SELECT t.*, p.status, p.result, p.audio_file_path
                 FROM transcripts t 
                 JOIN summary_processes p ON t.process_id = p.id 
                 WHERE t.process_id = ?
@@ -238,7 +282,8 @@ class DatabaseManager:
                     p.created_at,
                     p.status,
                     p.start_time,
-                    p.end_time
+                    p.end_time,
+                    p.audio_file_path
                 FROM summary_processes p
                 LEFT JOIN transcripts t ON p.id = t.process_id
                 WHERE p.status IN ('completed', 'failed', 'pending')
@@ -258,6 +303,7 @@ class DatabaseManager:
                             "status": row[3].lower() if row[3] else "pending",
                             "start_time": row[4],
                             "end_time": row[5],
+                            "audio_file_path": row[6],
                         }
                     )
                 return meetings
@@ -265,7 +311,11 @@ class DatabaseManager:
     async def delete_meeting(self, process_id: str) -> bool:
         """Xóa vĩnh viễn một cuộc họp khỏi Database"""
         async with self._get_connection() as conn:
-            # Xóa email logs trước (do có khóa ngoại)
+            # Xóa speaker contributions trước (do có khóa ngoại)
+            await conn.execute(
+                "DELETE FROM speaker_contributions WHERE process_id = ?", (process_id,)
+            )
+            # Xóa email logs
             await conn.execute(
                 "DELETE FROM email_logs WHERE process_id = ?", (process_id,)
             )
@@ -285,7 +335,12 @@ class DatabaseManager:
         cutoff = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
 
         async with self._get_connection() as conn:
-            # Xóa email logs trước
+            # Xóa speaker contributions trước
+            await conn.execute(
+                "DELETE FROM speaker_contributions WHERE process_id IN (SELECT id FROM summary_processes WHERE created_at < ?)",
+                (cutoff,),
+            )
+            # Xóa email logs
             await conn.execute(
                 "DELETE FROM email_logs WHERE process_id IN (SELECT id FROM summary_processes WHERE created_at < ?)",
                 (cutoff,),
@@ -364,3 +419,58 @@ class DatabaseManager:
                 rows = await cursor.fetchall()
                 columns = [col[0] for col in cursor.description]
                 return [dict(zip(columns, row)) for row in rows]
+
+    # ==================== SPEAKER CONTRIBUTIONS METHODS ====================
+
+    async def save_speaker_contributions(
+        self,
+        process_id: str,
+        contributions: List[Dict[str, Any]],
+    ):
+        """Lưu phân tích mức độ đóng góp của các thành viên"""
+        now = datetime.utcnow().isoformat()
+
+        async with self._get_connection() as conn:
+            for speaker in contributions:
+                speaker_id = str(uuid.uuid4())
+                await conn.execute(
+                    """
+                    INSERT OR REPLACE INTO speaker_contributions 
+                    (id, process_id, speaker_name, contribution_percent, talk_time_seconds, sentence_count, analyzed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        speaker_id,
+                        process_id,
+                        speaker.get("name"),
+                        speaker.get("contribution", 0),
+                        speaker.get("talk_time", 0),
+                        speaker.get("sentence_count", 0),
+                        now,
+                    ),
+                )
+            await conn.commit()
+            logger.info(f"✅ Đã lưu phân tích đóng góp cho process {process_id}")
+
+    async def get_speaker_contributions(self, process_id: str) -> List[Dict[str, Any]]:
+        """Lấy phân tích mức độ đóng góp của các thành viên"""
+        async with self._get_connection() as conn:
+            async with conn.execute(
+                """
+                SELECT speaker_name, contribution_percent, talk_time_seconds, sentence_count
+                FROM speaker_contributions 
+                WHERE process_id = ?
+                ORDER BY contribution_percent DESC
+                """,
+                (process_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [
+                    {
+                        "name": row[0],
+                        "contribution": row[1],
+                        "talk_time": row[2],
+                        "sentence_count": row[3],
+                    }
+                    for row in rows
+                ]
