@@ -41,31 +41,26 @@ class WhisperXService:
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
-        print(f"🎤 Xử lý Diarization cho file: {audio_path}")
+        print(f"🎤 Processing Diarization for: {audio_path}")
         audio_numpy = None
         sample_rate = None
 
-        # ==================== 1. LOAD AUDIO BẰNG LIBROSA ====================
+        # ==================== 1. LOAD AUDIO ====================
         try:
-            # Dùng librosa.load - xử lý tốt file WAV lỗi header
             audio_numpy, sample_rate = librosa.load(audio_path, sr=16000, mono=True)
             print(f"✅ Librosa loaded. Duration: {len(audio_numpy)/sample_rate:.2f}s")
 
         except Exception as e:
             print(f"⚠️ Librosa fail: {e}")
 
-            # ==================== 2. FALLBACK: ĐỌC RAW (BYPASS HEADER) ====================
             try:
                 print("🔄 Fallback: Reading RAW audio data (bypassing header)...")
                 with open(audio_path, "rb") as f:
                     raw_data = f.read()
 
-                    # Kiểm tra file có đủ lớn không
                     if len(raw_data) < 44:
-                        raise RuntimeError(f"File quá nhỏ: {len(raw_data)} bytes")
+                        raise RuntimeError(f"File too small: {len(raw_data)} bytes")
 
-                    # Bỏ qua 44 byte header (dù nó có lỗi hay không)
-                    # Rust ghi 16-bit PCM, sample rate 44100 Hz
                     audio_numpy = (
                         np.frombuffer(raw_data[44:], dtype=np.int16).astype(np.float32)
                         / 32768.0
@@ -76,7 +71,6 @@ class WhisperXService:
                         f"   Raw data size: {len(raw_data)} bytes, audio samples: {len(audio_numpy)}"
                     )
 
-                    # Resample về 16000Hz cho WhisperX
                     if sample_rate != 16000:
                         print(f"   🔄 Resampling from {sample_rate}Hz to 16000Hz")
                         audio_numpy = librosa.resample(
@@ -92,17 +86,15 @@ class WhisperXService:
                 print(f"❌ All loading methods failed: {e2}")
                 raise RuntimeError(f"Could not read audio file: {e2}")
 
-        # Chuyển thành tensor cho Pyannote
         waveform = torch.from_numpy(audio_numpy).unsqueeze(0)
 
         # ==================== 2. TRANSCRIPTION ====================
         print("📝 Transcribing with WhisperX...")
         try:
-            # 🔥 SỬA QUAN TRỌNG: Chỉ định language='en' để tránh tải model tiếng Trung
             result = self.model.transcribe(
                 audio_numpy,
                 batch_size=16,
-                language="en",  # 👈 ÉP TIẾNG ANH - TRÁNH TẢI MODEL 1.28GB
+                language="en",
             )
             print(f"✅ Transcription complete: {len(result['segments'])} segments")
         except Exception as e:
@@ -113,7 +105,6 @@ class WhisperXService:
         print("🔄 Running alignment...")
         try:
             if self.align_model is None:
-                # 🔥 Dùng language từ kết quả transcription (sẽ là 'en')
                 self.align_model, self.align_metadata = whisperx.load_align_model(
                     language_code=result["language"], device=self.device
                 )
@@ -183,16 +174,27 @@ class WhisperXService:
 
                 print(f"   Found {len(speaker_segments)} speaker segments")
 
+                # OPTIMIZATION: Sort and early stop
+                speaker_segments.sort(key=lambda x: x["start"])
+
                 for segment in result["segments"]:
                     best_speaker = "SPEAKER_00"
                     max_overlap = 0
+                    segment_start = segment["start"]
+                    segment_end = segment["end"]
+
                     for spk_seg in speaker_segments:
-                        overlap_start = max(segment["start"], spk_seg["start"])
-                        overlap_end = min(segment["end"], spk_seg["end"])
+                        if spk_seg["start"] > segment_end:
+                            break
+
+                        overlap_start = max(segment_start, spk_seg["start"])
+                        overlap_end = min(segment_end, spk_seg["end"])
                         overlap_duration = max(0, overlap_end - overlap_start)
+
                         if overlap_duration > max_overlap:
                             max_overlap = overlap_duration
                             best_speaker = spk_seg["speaker"]
+
                     segment["speaker"] = best_speaker
 
                 unique_speakers = sorted(
@@ -211,9 +213,18 @@ class WhisperXService:
             for seg in result["segments"]:
                 seg["speaker"] = "UNKNOWN"
 
+        # ==================== 5. CLEANUP ====================
+        del waveform
+        del audio_numpy
         gc.collect()
 
-        # ==================== 5. FORMAT OUTPUT ====================
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+            print("✅ Cleared Metal cache (MPS)")
+
+        print("♻️ WhisperX processing complete")
+
+        # ==================== 6. FORMAT OUTPUT ====================
         final_segments = []
         for seg in result["segments"]:
             final_segments.append(
